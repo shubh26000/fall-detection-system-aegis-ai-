@@ -77,6 +77,7 @@ public class MainActivity extends AppCompatActivity {
     private final MemberProfile memberProfile = new MemberProfile();
     private final List<ChatMessage> chatMessages = new ArrayList<>();
     private SharedPreferences analyticsPrefs;
+    private androidx.activity.result.ActivityResultLauncher<Intent> ringtonePickerLauncher;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -99,20 +100,52 @@ public class MainActivity extends AppCompatActivity {
 
         vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
 
-        mediaPlayer = MediaPlayer.create(this, R.raw.alert);
-        if (mediaPlayer != null) {
-            mediaPlayer.setLooping(true);
-            mediaPlayer.setVolume(1f, 1f);
-        }
-
         analyticsPrefs = getSharedPreferences("fall_analytics", MODE_PRIVATE);
-        chatMessages.add(new ChatMessage("Aegis AI", "Hi, I can answer safety questions, explain fall prevention, and use this app's monitoring context.", false));
+
+        ringtonePickerLauncher = registerForActivityResult(
+                new androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() == android.app.Activity.RESULT_OK && result.getData() != null) {
+                        Uri uri = result.getData().getParcelableExtra(android.media.RingtoneManager.EXTRA_RINGTONE_PICKED_URI);
+                        if (uri != null) {
+                            analyticsPrefs.edit().putString("custom_alarm_uri", uri.toString()).apply();
+                        } else {
+                            analyticsPrefs.edit().remove("custom_alarm_uri").apply();
+                        }
+                        initializeMediaPlayer();
+                        if ("Settings".equals(selectedTab)) {
+                            renderSettings();
+                        }
+                    }
+                }
+        );
+
+        initializeMediaPlayer();
+
+        chatMessages.add(new ChatMessage("Aegis AI", "How can I help?", false));
 
         setupNavigation();
         setupEmergencyButtons();
         setupKeyboardAwareScrolling();
         renderHome();
         startMonitoring();
+    }
+
+    private void initializeMediaPlayer() {
+        if (mediaPlayer != null) {
+            if (mediaPlayer.isPlaying()) mediaPlayer.stop();
+            mediaPlayer.release();
+        }
+        String customUri = analyticsPrefs.getString("custom_alarm_uri", null);
+        if (customUri != null) {
+            mediaPlayer = MediaPlayer.create(this, Uri.parse(customUri));
+        } else {
+            mediaPlayer = MediaPlayer.create(this, R.raw.alert);
+        }
+        if (mediaPlayer != null) {
+            mediaPlayer.setLooping(true);
+            mediaPlayer.setVolume(1f, 1f);
+        }
     }
 
     private void setupKeyboardAwareScrolling() {
@@ -378,10 +411,34 @@ public class MainActivity extends AppCompatActivity {
         selectedTab = "Home";
         updateNavSelection(0);
         resetScreen();
+        updateGreetingUI();
         addAssistantMessage("Recommendation", fallLatched ? "Confirm safety, keep the phone nearby, and call " + emergencyNumber + " if needed." : "How are you feeling today? Monitoring is active. Keep pathways clear, use good lighting, and keep the wearable charged.");
         addChatPanel();
         addDashboardGrid();
         fadeScreenIn();
+    }
+
+    private void updateGreetingUI() {
+        TextView greetingText = findViewById(R.id.greetingText);
+        TextView weatherIcon = findViewById(R.id.weatherIcon);
+        if (greetingText == null || weatherIcon == null) return;
+        
+        java.util.Calendar cal = java.util.Calendar.getInstance();
+        int hour = cal.get(java.util.Calendar.HOUR_OF_DAY);
+        
+        if (hour >= 5 && hour < 12) {
+            greetingText.setText("Good Morning");
+            weatherIcon.setText("☀️");
+        } else if (hour >= 12 && hour < 17) {
+            greetingText.setText("Good Afternoon");
+            weatherIcon.setText("🌤️");
+        } else if (hour >= 17 && hour < 21) {
+            greetingText.setText("Good Evening");
+            weatherIcon.setText("🌥️");
+        } else {
+            greetingText.setText("Good Night");
+            weatherIcon.setText("🌙");
+        }
     }
 
     private void renderMonitoring() {
@@ -401,7 +458,7 @@ public class MainActivity extends AppCompatActivity {
         resetScreen();
         addSectionTitle("Member Profile");
         addProfileCard();
-        Button addMember = createButton("Add Member", R.drawable.button_cyan, R.color.amoled_black);
+        Button addMember = createButton("Edit Member", R.drawable.button_cyan, R.color.amoled_black);
         addMember.setOnClickListener(v -> showMemberEditor());
         screenContainer.addView(addMember);
         fadeScreenIn();
@@ -416,9 +473,11 @@ public class MainActivity extends AppCompatActivity {
         Button callButton = createButton("Call Emergency " + emergencyNumber, R.drawable.button_alert, R.color.text_primary);
         callButton.setOnClickListener(v -> dialEmergencyNumber());
         screenContainer.addView(callButton);
-        Button safeButton = createButton("Mark Safe", R.drawable.button_cyan, R.color.amoled_black);
-        safeButton.setOnClickListener(v -> markAsSafe());
-        screenContainer.addView(safeButton);
+        if (fallLatched) {
+            Button safeButton = createButton("Mark Safe", R.drawable.button_cyan, R.color.amoled_black);
+            safeButton.setOnClickListener(v -> markAsSafe());
+            screenContainer.addView(safeButton);
+        }
         fadeScreenIn();
     }
 
@@ -429,16 +488,83 @@ public class MainActivity extends AppCompatActivity {
         addSectionTitle("Settings");
         addInfoCard("Emergency number", emergencyNumber, R.color.soft_cyan);
         addInfoCard("Sensitivity mode", "Medium\nBalanced for daily movement.", R.color.warning_gold);
-        addInfoCard("Alert sound", "Default continuous alarm", R.color.safe_green);
+        
+        addAlarmSoundCard();
 
         Button editEmergency = createButton("Change Emergency Number", R.drawable.button_outline, R.color.text_primary);
         editEmergency.setOnClickListener(v -> showEmergencyNumberDialog());
         screenContainer.addView(editEmergency);
-
-        Button editMember = createButton("Change Member Details", R.drawable.button_outline, R.color.text_primary);
-        editMember.setOnClickListener(v -> showMemberEditor());
-        screenContainer.addView(editMember);
         fadeScreenIn();
+    }
+
+    private void addAlarmSoundCard() {
+        LinearLayout card = createCard();
+
+        TextView title = createText("Alarm Sound", 16, R.color.neon_cyan, true);
+        title.setPadding(0, 0, 0, dp(8));
+        card.addView(title);
+
+        String customUri = analyticsPrefs.getString("custom_alarm_uri", null);
+        String soundStatus = customUri != null ? "Custom Tone Selected" : "Default Continuous Alarm";
+        TextView status = createText("Current: " + soundStatus, 14, R.color.text_primary, false);
+        status.setPadding(0, 0, 0, dp(16));
+        card.addView(status);
+
+        LinearLayout buttonsRow = new LinearLayout(this);
+        buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button changeBtn = createButton("Change Sound", R.drawable.button_cyan, R.color.amoled_black);
+        changeBtn.setOnClickListener(v -> {
+            Intent intent = new Intent(android.media.RingtoneManager.ACTION_RINGTONE_PICKER);
+            intent.putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_TYPE, android.media.RingtoneManager.TYPE_ALARM | android.media.RingtoneManager.TYPE_RINGTONE | android.media.RingtoneManager.TYPE_NOTIFICATION);
+            intent.putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true);
+            intent.putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true);
+            if (customUri != null) {
+                intent.putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, Uri.parse(customUri));
+            }
+            ringtonePickerLauncher.launch(intent);
+        });
+
+        Button previewBtn = createButton("Preview", R.drawable.button_outline, R.color.text_primary);
+        previewBtn.setOnClickListener(v -> {
+            if (mediaPlayer != null) {
+                if (mediaPlayer.isPlaying()) {
+                    mediaPlayer.pause();
+                    mediaPlayer.seekTo(0);
+                    previewBtn.setText("Preview");
+                } else {
+                    mediaPlayer.start();
+                    previewBtn.setText("Stop");
+                }
+            }
+        });
+
+        LinearLayout.LayoutParams btnParams1 = new LinearLayout.LayoutParams(0, dp(54), 1f);
+        btnParams1.setMargins(0, 0, dp(8), dp(12));
+        changeBtn.setLayoutParams(btnParams1);
+        buttonsRow.addView(changeBtn);
+
+        LinearLayout.LayoutParams btnParams2 = new LinearLayout.LayoutParams(0, dp(54), 1f);
+        btnParams2.setMargins(0, 0, 0, dp(12));
+        previewBtn.setLayoutParams(btnParams2);
+        buttonsRow.addView(previewBtn);
+
+        card.addView(buttonsRow);
+
+        if (customUri != null) {
+            Button resetBtn = createButton("Reset to Default", R.drawable.button_outline, R.color.alert_red);
+            resetBtn.setOnClickListener(v -> {
+                if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                    mediaPlayer.pause();
+                }
+                analyticsPrefs.edit().remove("custom_alarm_uri").apply();
+                initializeMediaPlayer();
+                renderSettings();
+            });
+            card.addView(resetBtn);
+        }
+
+        screenContainer.addView(card);
     }
 
     private void renderChat() {
@@ -697,15 +823,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String buildPrompt(String question) {
-        return "You are Aegis AI, a calm healthcare safety assistant inside an elderly fall detection app. " +
-                "Give helpful, practical, non-diagnostic safety advice. Tell the user to contact a doctor or emergency services when appropriate. " +
+        return "You are Aegis AI, a friendly and human-like companion inside an elderly care app. " +
+                "You can chat naturally about ANY topic the user brings up. " +
+                "If they ask about health or safety, provide helpful, practical advice. " +
                 "Current app context: fallLatched=" + fallLatched +
                 ", fallsThisMonth=" + getFallsThisMonth() +
                 ", likelyFallTime='" + getMostLikelyFallTime() +
                 "', memberAge=" + memberProfile.age +
                 ", condition='" + memberProfile.condition +
-                "', emergencyNumber=" + emergencyNumber +
-                ". User asks: " + question;
+                "'. Be conversational, brief, and friendly. User asks: " + question;
     }
 
     private String callGemini(String prompt) {
@@ -767,14 +893,47 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void addProfileCard() {
-        addInfoCard(memberProfile.name,
-                "Age: " + memberProfile.age +
-                        "\nCondition: " + memberProfile.condition +
-                        "\nBlood group: " + memberProfile.bloodGroup +
-                        "\nEmergency: " + memberProfile.emergencyContact +
-                        "\nAddress: " + memberProfile.address +
-                        "\nNotes: " + memberProfile.notes,
-                R.color.neon_cyan);
+        LinearLayout card = createCard();
+
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        
+        TextView label = createText(memberProfile.name, 18, R.color.neon_cyan, true);
+        LinearLayout.LayoutParams labelParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        headerRow.addView(label, labelParams);
+
+        TextView dots = createText("⋮", 24, R.color.text_secondary, true);
+        dots.setPadding(dp(10), dp(5), dp(10), dp(5));
+        dots.setOnClickListener(v -> {
+            android.widget.PopupMenu popup = new android.widget.PopupMenu(this, dots);
+            popup.getMenu().add("Edit");
+            popup.setOnMenuItemClickListener(item -> {
+                if (item.getTitle().equals("Edit")) {
+                    showMemberEditor();
+                    return true;
+                }
+                return false;
+            });
+            popup.show();
+        });
+        headerRow.addView(dots);
+        
+        card.addView(headerRow);
+
+        String body = "Age: " + memberProfile.age +
+                "\nCondition: " + memberProfile.condition +
+                "\nBlood group: " + memberProfile.bloodGroup +
+                "\nEmergency: " + memberProfile.emergencyContact +
+                "\nAddress: " + memberProfile.address +
+                "\nNotes: " + memberProfile.notes;
+
+        TextView message = createText(body, 15, R.color.text_primary, false);
+        message.setLineSpacing(4f, 1f);
+        message.setPadding(0, dp(7), 0, 0);
+
+        card.addView(message);
+        screenContainer.addView(card);
     }
 
     private void addAssistantMessage(String title, String body) {
@@ -972,71 +1131,242 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showMemberDetailsUI() {
-        new AlertDialog.Builder(this)
-                .setTitle("Member Profile")
-                .setMessage(
-                        "Name: " + memberProfile.name + "\n\n" +
-                                "Age: " + memberProfile.age + "\n\n" +
-                                "Condition: " + memberProfile.condition + "\n\n" +
-                                "Emergency Contact: " + memberProfile.emergencyContact + "\n\n" +
-                                "Blood Group: " + memberProfile.bloodGroup + "\n\n" +
-                                "Address: " + memberProfile.address + "\n\n" +
-                                "Notes: " + memberProfile.notes
-                )
-                .setPositiveButton("OK", null)
-                .show();
+        android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT));
+
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setBackgroundResource(R.drawable.dialog_bg_bw);
+        form.setPadding(dp(20), dp(20), dp(20), dp(20));
+        
+        TextView title = createText("Member Profile", 20, R.color.text_primary, true);
+        title.setPadding(0, 0, 0, dp(16));
+        form.addView(title);
+        
+        String details = "Name: " + memberProfile.name + "\n\n" +
+                         "Age: " + memberProfile.age + "\n\n" +
+                         "Condition: " + memberProfile.condition + "\n\n" +
+                         "Emergency Contact: " + memberProfile.emergencyContact + "\n\n" +
+                         "Blood Group: " + memberProfile.bloodGroup + "\n\n" +
+                         "Address: " + memberProfile.address + "\n\n" +
+                         "Notes: " + memberProfile.notes;
+                         
+        TextView body = createText(details, 16, R.color.text_secondary, false);
+        form.addView(body);
+
+        Button okBtn = createButton("OK", R.drawable.button_cyan, R.color.amoled_black);
+        LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(50));
+        btnParams.setMargins(0, dp(20), 0, 0);
+        form.addView(okBtn, btnParams);
+        okBtn.setOnClickListener(v -> dialog.dismiss());
+
+        dialog.setContentView(form);
+        dialog.show();
+        dialog.getWindow().setLayout((int)(getResources().getDisplayMetrics().widthPixels * 0.88), android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+    }
+
+    private EditText createStyledInput(String hint, String value) {
+        EditText input = new EditText(this);
+        input.setHint(hint);
+        input.setText(value);
+        input.setTextColor(getColor(R.color.text_primary));
+        input.setHintTextColor(android.graphics.Color.GRAY);
+        input.setBackgroundResource(R.drawable.input_bg_bw);
+        input.setPadding(dp(12), dp(12), dp(12), dp(12));
+        
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        params.setMargins(0, 0, 0, dp(10));
+        input.setLayoutParams(params);
+        return input;
     }
 
     private void showMemberEditor() {
+        android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT));
+
+        ScrollView scroll = new ScrollView(this);
         LinearLayout form = new LinearLayout(this);
         form.setOrientation(LinearLayout.VERTICAL);
-        form.setPadding(dp(8), 0, dp(8), 0);
+        form.setBackgroundResource(R.drawable.dialog_bg_bw);
+        form.setPadding(dp(20), dp(20), dp(20), dp(20));
+        
+        TextView title = createText("Edit Member Details", 20, R.color.text_primary, true);
+        title.setPadding(0, 0, 0, dp(16));
+        form.addView(title);
 
-        EditText nameInput = createInput("Name", memberProfile.name);
-        EditText ageInput = createInput("Age", memberProfile.age);
-        EditText conditionInput = createInput("Medical condition", memberProfile.condition);
-        EditText contactInput = createInput("Emergency contact", memberProfile.emergencyContact);
-        EditText bloodInput = createInput("Blood group", memberProfile.bloodGroup);
-        EditText addressInput = createInput("Address", memberProfile.address);
-        EditText notesInput = createInput("Notes", memberProfile.notes);
+        EditText nameInput = createStyledInput("Name", memberProfile.name);
+        EditText ageInput = createStyledInput("Age", memberProfile.age);
+        ageInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        ageInput.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(3)});
+        EditText conditionInput = createStyledInput("Medical condition", memberProfile.condition);
+        
+        LinearLayout contactContainer = new LinearLayout(this);
+        contactContainer.setOrientation(LinearLayout.HORIZONTAL);
+        contactContainer.setBackgroundResource(R.drawable.input_bg_bw);
+        contactContainer.setGravity(Gravity.CENTER_VERTICAL);
+        
+        LinearLayout.LayoutParams contactParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        contactParams.setMargins(0, 0, 0, dp(12));
+        contactContainer.setLayoutParams(contactParams);
+
+        TextView contactPrefix = createText("+91 ", 16, R.color.text_primary, true);
+        contactPrefix.setPadding(dp(12), dp(12), 0, dp(12));
+        contactContainer.addView(contactPrefix);
+
+        EditText contactInput = new EditText(this);
+        contactInput.setHint("10-digit contact");
+        String currentContactNum = memberProfile.emergencyContact != null ? memberProfile.emergencyContact : "";
+        if (currentContactNum.startsWith("+91 ")) currentContactNum = currentContactNum.substring(4);
+        else if (currentContactNum.startsWith("+91")) currentContactNum = currentContactNum.substring(3);
+        contactInput.setText(currentContactNum.trim());
+        contactInput.setTextColor(getColor(R.color.text_primary));
+        contactInput.setHintTextColor(android.graphics.Color.GRAY);
+        contactInput.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        contactInput.setPadding(0, dp(12), dp(12), dp(12));
+        contactInput.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
+        contactInput.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(10)});
+        
+        LinearLayout.LayoutParams inputParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        contactContainer.addView(contactInput, inputParams);
+
+        EditText bloodInput = createStyledInput("Blood group", memberProfile.bloodGroup);
+        bloodInput.setFocusable(false);
+        bloodInput.setClickable(true);
+        bloodInput.setOnClickListener(v -> {
+            String[] bloodGroups = {"A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"};
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("Select Blood Group")
+                    .setItems(bloodGroups, (dialogInterface, i) -> {
+                        bloodInput.setText(bloodGroups[i]);
+                    })
+                    .show();
+        });
+        EditText addressInput = createStyledInput("Address", memberProfile.address);
+        EditText notesInput = createStyledInput("Notes", memberProfile.notes);
 
         form.addView(nameInput);
         form.addView(ageInput);
         form.addView(conditionInput);
-        form.addView(contactInput);
+        form.addView(contactContainer);
         form.addView(bloodInput);
         form.addView(addressInput);
         form.addView(notesInput);
 
-        new AlertDialog.Builder(this)
-                .setTitle("Member Details")
-                .setView(form)
-                .setPositiveButton("Save", (dialog, which) -> {
-                    memberProfile.name = nameInput.getText().toString();
-                    memberProfile.age = ageInput.getText().toString();
-                    memberProfile.condition = conditionInput.getText().toString();
-                    memberProfile.emergencyContact = contactInput.getText().toString();
-                    memberProfile.bloodGroup = bloodInput.getText().toString();
-                    memberProfile.address = addressInput.getText().toString();
-                    memberProfile.notes = notesInput.getText().toString();
-                    renderMembers();
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+        LinearLayout buttonsRow = new LinearLayout(this);
+        buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
+        buttonsRow.setGravity(Gravity.END);
+        buttonsRow.setPadding(0, dp(16), 0, 0);
+
+        Button cancelBtn = createButton("Cancel", R.drawable.button_outline, R.color.text_primary);
+        Button saveBtn = createButton("Save", R.drawable.button_cyan, R.color.amoled_black);
+
+        LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(0, dp(50), 1f);
+        btnParams.setMargins(0, 0, dp(10), 0);
+        buttonsRow.addView(cancelBtn, btnParams);
+        
+        LinearLayout.LayoutParams btnParams2 = new LinearLayout.LayoutParams(0, dp(50), 1f);
+        buttonsRow.addView(saveBtn, btnParams2);
+
+        cancelBtn.setOnClickListener(v -> dialog.dismiss());
+        saveBtn.setOnClickListener(v -> {
+            memberProfile.name = nameInput.getText().toString();
+            memberProfile.age = ageInput.getText().toString();
+            memberProfile.condition = conditionInput.getText().toString();
+            memberProfile.emergencyContact = "+91 " + contactInput.getText().toString().trim();
+            memberProfile.bloodGroup = bloodInput.getText().toString();
+            memberProfile.address = addressInput.getText().toString();
+            memberProfile.notes = notesInput.getText().toString();
+            renderMembers();
+            dialog.dismiss();
+        });
+
+        form.addView(buttonsRow);
+        scroll.addView(form);
+        dialog.setContentView(scroll);
+        dialog.show();
+        dialog.getWindow().setLayout((int)(getResources().getDisplayMetrics().widthPixels * 0.88), android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
     }
 
     private void showEmergencyNumberDialog() {
-        EditText input = createInput("Emergency number", emergencyNumber);
+        android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT));
 
-        new AlertDialog.Builder(this)
-                .setTitle("Emergency Number")
-                .setView(input)
-                .setPositiveButton("Save", (dialog, which) -> {
-                    emergencyNumber = input.getText().toString().trim();
-                    renderSettings();
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setBackgroundResource(R.drawable.dialog_bg_bw);
+        form.setPadding(dp(20), dp(20), dp(20), dp(20));
+
+        TextView title = createText("Emergency Number", 20, R.color.text_primary, true);
+        title.setPadding(0, 0, 0, dp(16));
+        form.addView(title);
+
+        LinearLayout phoneContainer = new LinearLayout(this);
+        phoneContainer.setOrientation(LinearLayout.HORIZONTAL);
+        phoneContainer.setBackgroundResource(R.drawable.input_bg_bw);
+        phoneContainer.setGravity(Gravity.CENTER_VERTICAL);
+        
+        LinearLayout.LayoutParams phoneParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        phoneParams.setMargins(0, 0, 0, dp(12));
+        phoneContainer.setLayoutParams(phoneParams);
+
+        TextView prefix = createText("+91 ", 16, R.color.text_primary, true);
+        prefix.setPadding(dp(12), dp(12), 0, dp(12));
+        phoneContainer.addView(prefix);
+
+        EditText input = new EditText(this);
+        input.setHint("10-digit number");
+        String currentNum = emergencyNumber.startsWith("+91 ") ? emergencyNumber.substring(4) : emergencyNumber;
+        if (currentNum.startsWith("+91")) currentNum = currentNum.substring(3);
+        input.setText(currentNum.trim());
+        input.setTextColor(getColor(R.color.text_primary));
+        input.setHintTextColor(android.graphics.Color.GRAY);
+        input.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        input.setPadding(0, dp(12), dp(12), dp(12));
+        input.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
+        input.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(10)});
+        
+        LinearLayout.LayoutParams inputParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        phoneContainer.addView(input, inputParams);
+        form.addView(phoneContainer);
+
+        LinearLayout buttonsRow = new LinearLayout(this);
+        buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
+        buttonsRow.setGravity(Gravity.END);
+        buttonsRow.setPadding(0, dp(16), 0, 0);
+
+        Button cancelBtn = createButton("Cancel", R.drawable.button_outline, R.color.text_primary);
+        Button saveBtn = createButton("Save", R.drawable.button_cyan, R.color.amoled_black);
+
+        LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(0, dp(50), 1f);
+        btnParams.setMargins(0, 0, dp(10), 0);
+        buttonsRow.addView(cancelBtn, btnParams);
+        
+        LinearLayout.LayoutParams btnParams2 = new LinearLayout.LayoutParams(0, dp(50), 1f);
+        buttonsRow.addView(saveBtn, btnParams2);
+
+        cancelBtn.setOnClickListener(v -> dialog.dismiss());
+        saveBtn.setOnClickListener(v -> {
+            emergencyNumber = "+91 " + input.getText().toString().trim();
+            renderSettings();
+            dialog.dismiss();
+        });
+
+        form.addView(buttonsRow);
+        dialog.setContentView(form);
+        dialog.show();
+        dialog.getWindow().setLayout((int)(getResources().getDisplayMetrics().widthPixels * 0.88), android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
     }
 
     private EditText createInput(String hint, String value) {
