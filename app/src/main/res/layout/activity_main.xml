@@ -15,7 +15,7 @@
         android:paddingStart="18dp"
         android:paddingTop="16dp"
         android:paddingEnd="18dp"
-        app:title="Aegis AI Care"
+        app:title="Aegis Care"
         app:titleTextColor="@color/text_primary" />
 
     <ScrollView
