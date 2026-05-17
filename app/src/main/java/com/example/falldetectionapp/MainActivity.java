@@ -35,7 +35,10 @@ import androidx.appcompat.widget.Toolbar;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
@@ -52,7 +55,9 @@ public class MainActivity extends AppCompatActivity {
 
     TextView statusText;
 
-    String espUrl = "http://192.168.137.191";
+    // ESP communication — IP populated at runtime via UDP discovery
+    private String espIP = null;
+    private boolean discovering = false;
 
     Handler handler = new Handler();
     boolean fallLatched = false;
@@ -153,7 +158,10 @@ public class MainActivity extends AppCompatActivity {
         setupKeyboardAwareScrolling();
         renderHome();
         applyThemeAtmosphere();
-        startMonitoring();
+        // Show searching status then start UDP discovery
+        statusText.setText("Searching for ESP device...");
+        assistantSummaryText.setText("Looking for wearable sensor on the network...");
+        discoverESP();
     }
 
     private void initializeMediaPlayer() {
@@ -272,11 +280,20 @@ public class MainActivity extends AppCompatActivity {
         Runnable runnable = new Runnable() {
             @Override
             public void run() {
+                // Skip poll if ESP not yet discovered
+                if (espIP == null) {
+                    handler.postDelayed(this, 1000);
+                    return;
+                }
 
                 new Thread(() -> {
                     String data = getESPData();
 
                     runOnUiThread(() -> {
+                        // If we keep getting ERROR, the ESP may have moved — re-discover
+                        if (data.equals("ERROR")) {
+                            discoverESP();
+                        }
 
                         if (data.equals("FALL") && !fallLatched && System.currentTimeMillis() > safeCooldownUntil) {
                             fallLatched = true;
@@ -314,6 +331,46 @@ public class MainActivity extends AppCompatActivity {
         };
 
         handler.post(runnable);
+    }
+
+    /** Listens on UDP port 4444 for the ESP broadcast: "ESP_FALL_DETECTOR:192.168.x.x" */
+    private void discoverESP() {
+        if (discovering) return;
+        discovering = true;
+
+        new Thread(() -> {
+            try {
+                DatagramSocket socket = new DatagramSocket(4444);
+                socket.setBroadcast(true);
+                socket.setSoTimeout(10000); // 10 s per receive attempt
+
+                byte[] buffer = new byte[256];
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+                while (espIP == null) {
+                    try {
+                        socket.receive(packet);
+                        String message = new String(packet.getData(), 0, packet.getLength());
+                        if (message.startsWith("ESP_FALL_DETECTOR:")) {
+                            espIP = message.replace("ESP_FALL_DETECTOR:", "").trim();
+                            runOnUiThread(() -> {
+                                statusText.setText("ESP found — monitoring active");
+                                statusText.setTextColor(themeManager.getAccent());
+                                assistantSummaryText.setText("Wearable sensor connected. Monitoring every second.");
+                                startMonitoring();
+                            });
+                            break;
+                        }
+                    } catch (Exception e) {
+                        // Receive timed out — loop and try again
+                    }
+                }
+                socket.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            discovering = false;
+        }).start();
     }
 
     private void startAlert() {
@@ -514,29 +571,28 @@ public class MainActivity extends AppCompatActivity {
     }
 
     public String getESPData() {
+        if (espIP == null) return "ERROR";
         try {
-            URL url = new URL(espUrl);
-
+            URL url = new URL("http://" + espIP);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-
-            BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(conn.getInputStream())
-            );
-
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(2000);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
             String line = reader.readLine();
             reader.close();
-
             return line;
-
         } catch (Exception e) {
             return "ERROR";
         }
     }
 
     private void sendReset() {
+        if (espIP == null) return;
         try {
-            URL url = new URL(espUrl + "/reset");
+            URL url = new URL("http://" + espIP + "/reset");
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(2000);
             conn.getInputStream();
         } catch (Exception ignored) {}
     }
