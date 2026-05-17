@@ -77,6 +77,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean keyboardVisible = false;
     private boolean keepKeyboardAfterChatRefresh = false;
     private boolean tabSwitchAnimating = false;
+    private long safeCooldownUntil = 0; // ignore FALL signals until this timestamp
     private final MemberProfile memberProfile = new MemberProfile();
     private final List<ChatMessage> chatMessages = new ArrayList<>();
     private SharedPreferences analyticsPrefs;
@@ -97,6 +98,15 @@ public class MainActivity extends AppCompatActivity {
         statusText = findViewById(R.id.statusText);
         assistantSummaryText = findViewById(R.id.assistantSummaryText);
         alertCard = findViewById(R.id.alertCard);
+        // Style alertCard with liquid-glass AMOLED look
+        if (alertCard != null) {
+            android.graphics.drawable.GradientDrawable alertBg = new android.graphics.drawable.GradientDrawable(
+                    android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
+                    new int[]{Color.argb(120, 80, 0, 0), Color.argb(200, 10, 0, 0)});
+            alertBg.setCornerRadius(dp(26));
+            alertBg.setStroke(dp(1), Color.argb(160, 200, 0, 0));
+            alertCard.setBackground(alertBg);
+        }
         screenContainer = findViewById(R.id.screenContainer);
         bottomNav = findViewById(R.id.bottomNav);
         contentScroll = findViewById(R.id.contentScroll);
@@ -268,7 +278,7 @@ public class MainActivity extends AppCompatActivity {
 
                     runOnUiThread(() -> {
 
-                        if (data.equals("FALL") && !fallLatched) {
+                        if (data.equals("FALL") && !fallLatched && System.currentTimeMillis() > safeCooldownUntil) {
                             fallLatched = true;
                             lastUiSensorState = "FALL";
                             lastAlert = "Fall alert at " + new SimpleDateFormat("hh:mm a", Locale.getDefault()).format(new Date());
@@ -328,43 +338,148 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showActionPopup() {
-        new AlertDialog.Builder(this)
-                .setTitle("Possible fall detected")
-                .setMessage("Aegis AI recommends confirming safety or calling emergency services.")
-                .setCancelable(false)
-                .setPositiveButton("Take Action", (d, w) -> showActionMenu())
-                .show();
+        // Build a liquid-glass emergency panel anchored to the bottom of the screen
+        android.view.ViewGroup rootView = (android.view.ViewGroup) findViewById(android.R.id.content);
+
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setLayoutParams(new android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+        overlay.setBackgroundColor(Color.argb(140, 0, 0, 0));
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(20), dp(24), dp(20), dp(32));
+
+        android.graphics.drawable.GradientDrawable panelBg = new android.graphics.drawable.GradientDrawable(
+                android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{Color.argb(230, 12, 4, 4), Color.argb(245, 5, 0, 0)});
+        panelBg.setCornerRadii(new float[]{dp(28), dp(28), dp(28), dp(28), 0, 0, 0, 0});
+        panelBg.setStroke(dp(1), Color.argb(180, 200, 20, 20));
+        panel.setBackground(panelBg);
+        panel.setElevation(dp(24));
+
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        panelParams.gravity = Gravity.BOTTOM;
+        panel.setLayoutParams(panelParams);
+
+        // Drag handle
+        android.view.View handle = new android.view.View(this);
+        android.graphics.drawable.GradientDrawable handleBg = new android.graphics.drawable.GradientDrawable();
+        handleBg.setColor(Color.argb(100, 200, 50, 50));
+        handleBg.setCornerRadius(dp(4));
+        handle.setBackground(handleBg);
+        LinearLayout.LayoutParams handleParams = new LinearLayout.LayoutParams(dp(40), dp(4));
+        handleParams.gravity = Gravity.CENTER_HORIZONTAL;
+        handleParams.setMargins(0, 0, 0, dp(20));
+        handle.setLayoutParams(handleParams);
+        panel.addView(handle);
+
+        // Header
+        TextView header = createText("🚨  Fall Detected", 22, R.color.text_primary, true);
+        header.setTextColor(Color.parseColor("#FF4444"));
+        header.setPadding(0, 0, 0, dp(6));
+        panel.addView(header);
+
+        TextView sub = createText("Aegis Care recommends confirming safety or calling emergency services.", 14, R.color.text_secondary, false);
+        sub.setLineSpacing(4f, 1f);
+        sub.setPadding(0, 0, 0, dp(24));
+        panel.addView(sub);
+
+        // Action: Call Emergency
+        Button callBtn = new Button(this);
+        callBtn.setText("📞  Call Emergency");
+        callBtn.setAllCaps(false);
+        callBtn.setTextSize(15);
+        callBtn.setTypeface(callBtn.getTypeface(), android.graphics.Typeface.BOLD);
+        callBtn.setTextColor(Color.WHITE);
+        android.graphics.drawable.GradientDrawable callBg = new android.graphics.drawable.GradientDrawable();
+        callBg.setColor(Color.argb(200, 160, 0, 0));
+        callBg.setCornerRadius(dp(16));
+        callBg.setStroke(dp(1), Color.argb(180, 255, 60, 60));
+        callBtn.setBackground(callBg);
+        LinearLayout.LayoutParams callP = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(54));
+        callP.setMargins(0, 0, 0, dp(10));
+        callBtn.setLayoutParams(callP);
+        callBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); rootView.removeView(overlay); dialEmergencyNumber(); });
+        panel.addView(callBtn);
+
+        // Action: View Profile
+        Button profileBtn = new Button(this);
+        profileBtn.setText("👤  View Member Profile");
+        profileBtn.setAllCaps(false);
+        profileBtn.setTextSize(15);
+        profileBtn.setTextColor(getColor(R.color.text_primary));
+        android.graphics.drawable.GradientDrawable profileBg = new android.graphics.drawable.GradientDrawable();
+        profileBg.setColor(Color.argb(100, 30, 30, 50));
+        profileBg.setCornerRadius(dp(16));
+        profileBg.setStroke(dp(1), Color.argb(80, 200, 200, 255));
+        profileBtn.setBackground(profileBg);
+        LinearLayout.LayoutParams profileP = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(54));
+        profileP.setMargins(0, 0, 0, dp(10));
+        profileBtn.setLayoutParams(profileP);
+        profileBtn.setOnClickListener(v -> showMemberDetailsUI());
+        panel.addView(profileBtn);
+
+        // Action: Mark Safe
+        Button safeBtn = new Button(this);
+        safeBtn.setText("✅  Mark as Safe");
+        safeBtn.setAllCaps(false);
+        safeBtn.setTextSize(15);
+        safeBtn.setTypeface(safeBtn.getTypeface(), android.graphics.Typeface.BOLD);
+        safeBtn.setTextColor(Color.parseColor("#111111"));
+        android.graphics.drawable.GradientDrawable safeBg = new android.graphics.drawable.GradientDrawable();
+        safeBg.setColor(themeManager.getAccent());
+        safeBg.setCornerRadius(dp(16));
+        safeBtn.setBackground(safeBg);
+        LinearLayout.LayoutParams safeP = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(54));
+        safeBtn.setLayoutParams(safeP);
+        safeBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); rootView.removeView(overlay); markAsSafe(); });
+        panel.addView(safeBtn);
+
+        overlay.addView(panel);
+        rootView.addView(overlay);
+
+        // Slide up animation
+        panel.setTranslationY(dp(400));
+        panel.animate().translationY(0).setDuration(320)
+                .setInterpolator(new DecelerateInterpolator()).start();
+
+        // Tapping outside dismisses
+        overlay.setOnClickListener(v -> {
+            panel.animate().translationY(dp(400)).setDuration(260).withEndAction(() -> {
+                overlay.setVisibility(View.GONE);
+                rootView.removeView(overlay);
+            }).start();
+        });
+        panel.setOnClickListener(v -> { /* consume so taps don't dismiss */ });
     }
 
+    // Legacy kept for menu fallback (not called anymore)
     private void showActionMenu() {
         new AlertDialog.Builder(this)
                 .setTitle("Emergency Actions")
-                .setItems(new String[]{
-                        "Call Emergency",
-                        "View Member Profile",
-                        "Mark as Safe"
-                }, (dialog, which) -> {
-
-                    if (which == 0) {
-                        dialEmergencyNumber();
-                    }
-
-                    if (which == 1) {
-                        showMemberDetailsUI();
-                    }
-
-                    if (which == 2) {
-                        markAsSafe();
-                    }
-                })
+                .setItems(new String[]{"Call Emergency", "View Member Profile", "Mark as Safe"},
+                        (dialog, which) -> {
+                            if (which == 0) dialEmergencyNumber();
+                            if (which == 1) showMemberDetailsUI();
+                            if (which == 2) markAsSafe();
+                        })
                 .show();
     }
 
     private void markAsSafe() {
         stopAlert();
         fallLatched = false;
-        lastUiSensorState = "";
-        sendReset();
+        lastUiSensorState = "NORMAL";
+        // 4-second cooldown: ignore any FALL signals right after reset
+        safeCooldownUntil = System.currentTimeMillis() + 4000;
+        // Send reset to ESP off the main thread
+        new Thread(this::sendReset).start();
 
         statusText.setText("Safe - Monitoring");
         statusText.setTextColor(getColor(R.color.safe_green));
@@ -1371,28 +1486,44 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout insightRow = new LinearLayout(this);
         insightRow.setOrientation(LinearLayout.HORIZONTAL);
         insightRow.setPadding(dp(16), 0, dp(16), dp(16));
+        // Allow insightRow itself to grow vertically with content
+        insightRow.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView insightIcon = createText("💬", 24, R.color.text_primary, false);
-        insightIcon.setPadding(0, 0, dp(12), 0);
-        insightRow.addView(insightIcon);
+        insightIcon.setPadding(0, dp(2), dp(12), 0);
+        // Pin icon to top so it doesn't stretch
+        LinearLayout.LayoutParams iconP = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        iconP.gravity = Gravity.TOP;
+        insightRow.addView(insightIcon, iconP);
 
         TextView insightText = createText("", 13, R.color.text_primary, false);
-        insightText.setLineSpacing(4f, 1f);
-        insightRow.addView(insightText);
+        insightText.setLineSpacing(5f, 1f);
+        // WRAP_CONTENT height so the card grows with the text; weight=1 fills width
+        insightRow.addView(insightText, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         reportCard.addView(insightRow);
         screenContainer.addView(reportCard);
 
+        // Handler-based typewriter — lets the layout system measure after each character
         String fullText = buildLocalAnalyticsSummary();
-        new Thread(() -> {
-            for (int i = 1; i <= fullText.length(); i++) {
-                final String partial = fullText.substring(0, i);
-                runOnUiThread(() -> insightText.setText(partial));
-                try {
-                    Thread.sleep(12);
-                } catch (InterruptedException e) {}
+        Handler typingHandler = new Handler(android.os.Looper.getMainLooper());
+        final int[] index = {0};
+        Runnable typeNext = new Runnable() {
+            @Override
+            public void run() {
+                if (index[0] <= fullText.length()) {
+                    insightText.setText(fullText.substring(0, index[0]));
+                    index[0]++;
+                    typingHandler.postDelayed(this, 14);
+                }
             }
-        }).start();
+        };
+        typingHandler.post(typeNext);
     }
 
     // Removed old unused analytic visualization methods
@@ -1556,18 +1687,44 @@ public class MainActivity extends AppCompatActivity {
         
         card.addView(headerRow);
 
-        String body = "Age: " + memberProfile.age +
-                "\nCondition: " + memberProfile.condition +
-                "\nBlood group: " + memberProfile.bloodGroup +
-                "\nEmergency: " + memberProfile.emergencyContact +
-                "\nAddress: " + memberProfile.address +
-                "\nNotes: " + memberProfile.notes;
+        // Field rows — same style as the edit-member dialog inputs
+        String[][] fields = {
+            {"Age",           memberProfile.age},
+            {"Condition",     memberProfile.condition},
+            {"Blood Group",   memberProfile.bloodGroup},
+            {"Emergency",     memberProfile.emergencyContact},
+            {"Address",       memberProfile.address},
+            {"Notes",         memberProfile.notes}
+        };
 
-        TextView message = createText(body, 15, R.color.text_primary, false);
-        message.setLineSpacing(4f, 1f);
-        message.setPadding(0, dp(7), 0, 0);
+        for (String[] field : fields) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
 
-        card.addView(message);
+            android.graphics.drawable.GradientDrawable rowBg = new android.graphics.drawable.GradientDrawable();
+            rowBg.setColor(Color.parseColor("#1A1A2A"));
+            rowBg.setCornerRadius(dp(14));
+            rowBg.setStroke(dp(1), themeManager.getAccentGlow());
+            row.setBackground(rowBg);
+            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+
+            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            rowParams.setMargins(0, 0, 0, dp(8));
+            row.setLayoutParams(rowParams);
+
+            TextView fieldLabel = createText(field[0], 12, R.color.text_secondary, true);
+            fieldLabel.setTextColor(themeManager.getAccent());
+            LinearLayout.LayoutParams labelP = new LinearLayout.LayoutParams(dp(90), LinearLayout.LayoutParams.WRAP_CONTENT);
+            row.addView(fieldLabel, labelP);
+
+            TextView fieldValue = createText(field[1], 14, R.color.text_primary, false);
+            row.addView(fieldValue, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+            card.addView(row);
+        }
+
         screenContainer.addView(card);
     }
 
