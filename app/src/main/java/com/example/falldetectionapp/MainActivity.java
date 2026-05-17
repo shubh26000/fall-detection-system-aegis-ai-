@@ -52,7 +52,7 @@ public class MainActivity extends AppCompatActivity {
 
     TextView statusText;
 
-    String espUrl = "http://192.168.137.34";
+    String espUrl = "http://192.168.137.191";
 
     Handler handler = new Handler();
     boolean fallLatched = false;
@@ -106,6 +106,15 @@ public class MainActivity extends AppCompatActivity {
 
         analyticsPrefs = getSharedPreferences("fall_analytics", MODE_PRIVATE);
         themeManager = new ThemeManager(analyticsPrefs);
+
+        // Restore persisted member profile (survives app restarts)
+        memberProfile.name             = analyticsPrefs.getString("member_name",      memberProfile.name);
+        memberProfile.age              = analyticsPrefs.getString("member_age",       memberProfile.age);
+        memberProfile.condition        = analyticsPrefs.getString("member_condition", memberProfile.condition);
+        memberProfile.emergencyContact = analyticsPrefs.getString("member_emergency", memberProfile.emergencyContact);
+        memberProfile.bloodGroup       = analyticsPrefs.getString("member_blood",     memberProfile.bloodGroup);
+        memberProfile.address          = analyticsPrefs.getString("member_address",   memberProfile.address);
+        memberProfile.notes            = analyticsPrefs.getString("member_notes",     memberProfile.notes);
 
         ringtonePickerLauncher = registerForActivityResult(
                 new androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult(),
@@ -2001,6 +2010,16 @@ public class MainActivity extends AppCompatActivity {
             memberProfile.bloodGroup = bloodInput.getText().toString();
             memberProfile.address = addressInput.getText().toString();
             memberProfile.notes = notesInput.getText().toString();
+            // Persist so changes survive app restarts
+            analyticsPrefs.edit()
+                    .putString("member_name", memberProfile.name)
+                    .putString("member_age", memberProfile.age)
+                    .putString("member_condition", memberProfile.condition)
+                    .putString("member_emergency", memberProfile.emergencyContact)
+                    .putString("member_blood", memberProfile.bloodGroup)
+                    .putString("member_address", memberProfile.address)
+                    .putString("member_notes", memberProfile.notes)
+                    .apply();
             renderMembers();
             dialog.dismiss();
         });
