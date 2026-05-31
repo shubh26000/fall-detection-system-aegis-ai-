@@ -14,6 +14,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Vibrator;
+import android.provider.Settings;
 import android.util.AttributeSet;
 import android.view.Gravity;
 import android.view.View;
@@ -56,8 +57,8 @@ public class MainActivity extends AppCompatActivity {
     TextView statusText;
 
     // ESP communication — IP populated at runtime via UDP discovery
-    private String espIP = null;
-    private boolean discovering = false;
+    private volatile String espIP = null;
+    private volatile boolean discovering = false;
 
     Handler handler = new Handler();
     boolean fallLatched = false;
@@ -82,7 +83,13 @@ public class MainActivity extends AppCompatActivity {
     private boolean keyboardVisible = false;
     private boolean keepKeyboardAfterChatRefresh = false;
     private boolean tabSwitchAnimating = false;
+    private boolean monitoringStarted = false;
+    private boolean waitingForNormalAfterSafe = false;
+    private int consecutivePollErrors = 0;
+    private long lastRediscoveryAttempt = 0;
+    private long lastResetAttempt = 0;
     private long safeCooldownUntil = 0; // ignore FALL signals until this timestamp
+    private FrameLayout activeOverlayPanel = null;
     private final MemberProfile memberProfile = new MemberProfile();
     private final List<ChatMessage> chatMessages = new ArrayList<>();
     private SharedPreferences analyticsPrefs;
@@ -130,12 +137,19 @@ public class MainActivity extends AppCompatActivity {
         memberProfile.bloodGroup       = analyticsPrefs.getString("member_blood",     memberProfile.bloodGroup);
         memberProfile.address          = analyticsPrefs.getString("member_address",   memberProfile.address);
         memberProfile.notes            = analyticsPrefs.getString("member_notes",     memberProfile.notes);
+        emergencyNumber = analyticsPrefs.getString("emergency_number", "112");
 
         ringtonePickerLauncher = registerForActivityResult(
                 new androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult(),
                 result -> {
                     if (result.getResultCode() == android.app.Activity.RESULT_OK && result.getData() != null) {
-                        Uri uri = result.getData().getParcelableExtra(android.media.RingtoneManager.EXTRA_RINGTONE_PICKED_URI);
+                        Uri uri;
+                        if (android.os.Build.VERSION.SDK_INT >= 33) {
+                            uri = result.getData().getParcelableExtra(android.media.RingtoneManager.EXTRA_RINGTONE_PICKED_URI, Uri.class);
+                        } else {
+                            //noinspection deprecation
+                            uri = result.getData().getParcelableExtra(android.media.RingtoneManager.EXTRA_RINGTONE_PICKED_URI);
+                        }
                         if (uri != null) {
                             analyticsPrefs.edit().putString("custom_alarm_uri", uri.toString()).apply();
                         } else {
@@ -156,6 +170,28 @@ public class MainActivity extends AppCompatActivity {
         setupNavigation();
         setupEmergencyButtons();
         setupKeyboardAwareScrolling();
+
+        // Modern back navigation handling (replaces deprecated onBackPressed)
+        getOnBackPressedDispatcher().addCallback(this, new androidx.activity.OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                if (activeOverlayPanel != null) {
+                    dismissActiveOverlay();
+                    return;
+                }
+                if (keyboardVisible) {
+                    hideKeyboard();
+                    return;
+                }
+                if (!"Home".equals(selectedTab)) {
+                    clearKeyboardRetention();
+                    animateTabSwitch(() -> renderHome());
+                    return;
+                }
+                finish();
+            }
+        });
+
         renderHome();
         applyThemeAtmosphere();
         // Show searching status then start UDP discovery
@@ -277,6 +313,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startMonitoring() {
+        if (monitoringStarted) {
+            return;
+        }
+        monitoringStarted = true;
+
         Runnable runnable = new Runnable() {
             @Override
             public void run() {
@@ -292,11 +333,24 @@ public class MainActivity extends AppCompatActivity {
                     runOnUiThread(() -> {
                         // If we keep getting ERROR, the ESP may have moved — re-discover
                         if (data.equals("ERROR")) {
-                            discoverESP();
+                            handlePollError();
+                            return;
+                        }
+
+                        consecutivePollErrors = 0;
+
+                        if (data.equals("NORMAL")) {
+                            waitingForNormalAfterSafe = false;
+                        }
+
+                        if (data.equals("FALL") && waitingForNormalAfterSafe) {
+                            retryResetIfNeeded();
+                            return;
                         }
 
                         if (data.equals("FALL") && !fallLatched && System.currentTimeMillis() > safeCooldownUntil) {
                             fallLatched = true;
+                            waitingForNormalAfterSafe = false;
                             lastUiSensorState = "FALL";
                             lastAlert = "Fall alert at " + new SimpleDateFormat("hh:mm a", Locale.getDefault()).format(new Date());
                             recordFallEvent(System.currentTimeMillis());
@@ -313,7 +367,7 @@ public class MainActivity extends AppCompatActivity {
                             showActionPopup();
                             refreshSelectedTab();
 
-                        } else if (!fallLatched && !lastUiSensorState.equals("NORMAL")) {
+                        } else if (data.equals("NORMAL") && !fallLatched && !lastUiSensorState.equals("NORMAL")) {
                             lastUiSensorState = "NORMAL";
                             statusText.setText("Normal");
                             statusText.setTextColor(themeManager.getAccent());
@@ -333,6 +387,35 @@ public class MainActivity extends AppCompatActivity {
         handler.post(runnable);
     }
 
+    private void handlePollError() {
+        consecutivePollErrors++;
+        if (consecutivePollErrors < 4) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now - lastRediscoveryAttempt < 10000) {
+            return;
+        }
+
+        lastRediscoveryAttempt = now;
+        espIP = null;
+        lastUiSensorState = "";
+        statusText.setText("Searching for wearable...");
+        assistantSummaryText.setText("Connection paused. Looking for your wearable again.");
+        discoverESP();
+    }
+
+    private void retryResetIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (now - lastResetAttempt < 1800) {
+            return;
+        }
+
+        lastResetAttempt = now;
+        new Thread(this::sendReset).start();
+    }
+
     /** Listens on UDP port 4444 for the ESP broadcast: "ESP_FALL_DETECTOR:192.168.x.x" */
     private void discoverESP() {
         if (discovering) return;
@@ -340,7 +423,9 @@ public class MainActivity extends AppCompatActivity {
 
         new Thread(() -> {
             try {
-                DatagramSocket socket = new DatagramSocket(4444);
+                DatagramSocket socket = new DatagramSocket(null);
+                socket.setReuseAddress(true);
+                socket.bind(new java.net.InetSocketAddress(4444));
                 socket.setBroadcast(true);
                 socket.setSoTimeout(10000); // 10 s per receive attempt
 
@@ -354,9 +439,12 @@ public class MainActivity extends AppCompatActivity {
                         if (message.startsWith("ESP_FALL_DETECTOR:")) {
                             espIP = message.replace("ESP_FALL_DETECTOR:", "").trim();
                             runOnUiThread(() -> {
-                                statusText.setText("ESP found — monitoring active");
                                 statusText.setTextColor(themeManager.getAccent());
+                                statusText.setText("Wearable found - monitoring active");
                                 assistantSummaryText.setText("Wearable sensor connected. Monitoring every second.");
+                                if ("Settings".equals(selectedTab)) {
+                                    renderSettings();
+                                }
                                 startMonitoring();
                             });
                             break;
@@ -399,6 +487,7 @@ public class MainActivity extends AppCompatActivity {
         android.view.ViewGroup rootView = (android.view.ViewGroup) findViewById(android.R.id.content);
 
         FrameLayout overlay = new FrameLayout(this);
+        activeOverlayPanel = overlay;
         overlay.setLayoutParams(new android.view.ViewGroup.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT));
@@ -460,7 +549,7 @@ public class MainActivity extends AppCompatActivity {
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(54));
         callP.setMargins(0, 0, 0, dp(10));
         callBtn.setLayoutParams(callP);
-        callBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); rootView.removeView(overlay); dialEmergencyNumber(); });
+        callBtn.setOnClickListener(v -> { activeOverlayPanel = null; overlay.setVisibility(View.GONE); rootView.removeView(overlay); dialEmergencyNumber(); });
         panel.addView(callBtn);
 
         // Action: View Profile
@@ -495,7 +584,7 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout.LayoutParams safeP = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(54));
         safeBtn.setLayoutParams(safeP);
-        safeBtn.setOnClickListener(v -> { overlay.setVisibility(View.GONE); rootView.removeView(overlay); markAsSafe(); });
+        safeBtn.setOnClickListener(v -> { activeOverlayPanel = null; overlay.setVisibility(View.GONE); rootView.removeView(overlay); markAsSafe(); });
         panel.addView(safeBtn);
 
         overlay.addView(panel);
@@ -509,6 +598,7 @@ public class MainActivity extends AppCompatActivity {
         // Tapping outside dismisses
         overlay.setOnClickListener(v -> {
             panel.animate().translationY(dp(400)).setDuration(260).withEndAction(() -> {
+                activeOverlayPanel = null;
                 overlay.setVisibility(View.GONE);
                 rootView.removeView(overlay);
             }).start();
@@ -533,8 +623,10 @@ public class MainActivity extends AppCompatActivity {
         stopAlert();
         fallLatched = false;
         lastUiSensorState = "NORMAL";
-        // 4-second cooldown: ignore any FALL signals right after reset
-        safeCooldownUntil = System.currentTimeMillis() + 4000;
+        waitingForNormalAfterSafe = true;
+        lastResetAttempt = System.currentTimeMillis();
+        // Ignore repeated FALL signals while the ESP reset catches up.
+        safeCooldownUntil = System.currentTimeMillis() + 20000;
         // Send reset to ESP off the main thread
         new Thread(this::sendReset).start();
 
@@ -580,7 +672,7 @@ public class MainActivity extends AppCompatActivity {
             BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
             String line = reader.readLine();
             reader.close();
-            return line;
+            return line == null ? "ERROR" : line.trim();
         } catch (Exception e) {
             return "ERROR";
         }
@@ -693,6 +785,7 @@ public class MainActivity extends AppCompatActivity {
     
     private void showWeatherPanel() {
         FrameLayout panel = new FrameLayout(this);
+        activeOverlayPanel = panel;
         panel.setLayoutParams(new android.view.ViewGroup.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT, 
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT));
@@ -724,6 +817,7 @@ public class MainActivity extends AppCompatActivity {
         closeBtn.setPadding(dp(16), dp(16), dp(16), dp(16));
         closeBtn.setOnClickListener(v -> {
             panel.animate().translationY(getResources().getDisplayMetrics().heightPixels).setDuration(300).withEndAction(() -> {
+                activeOverlayPanel = null;
                 ((android.view.ViewGroup)findViewById(android.R.id.content)).removeView(panel);
             }).start();
         });
@@ -776,6 +870,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         ((android.view.ViewGroup)findViewById(android.R.id.content)).addView(panel);
+        activeOverlayPanel = panel;
         panel.setTranslationY(getResources().getDisplayMetrics().heightPixels);
         panel.animate().translationY(0f).setInterpolator(new DecelerateInterpolator()).setDuration(400).start();
 
@@ -1146,6 +1241,7 @@ public class MainActivity extends AppCompatActivity {
         addSectionTitle("Settings");
         addInfoCard("Emergency number", emergencyNumber, R.color.soft_cyan);
         addInfoCard("Sensitivity mode", "Medium\nBalanced for daily movement.", R.color.warning_gold);
+        addDeviceSetupCard();
 
         // ── Appearance & Theme card ──────────────────────────────────────────────
         LinearLayout themeCard = createCard();
@@ -1222,6 +1318,132 @@ public class MainActivity extends AppCompatActivity {
         fadeScreenIn();
     }
 
+
+    private void addDeviceSetupCard() {
+        LinearLayout card = createCard();
+
+        TextView title = createText("Device Setup", 16, R.color.neon_cyan, true);
+        title.setTextColor(themeManager.getAccent());
+        title.setPadding(0, 0, 0, dp(8));
+        card.addView(title);
+
+        String state;
+        if (espIP != null) {
+            state = "Wearable connected. You can update its WiFi or search again if you changed networks.";
+        } else if (discovering) {
+            state = "Searching for your wearable nearby...";
+        } else {
+            state = "No wearable connected yet. Put the device on the same WiFi or connect to its setup hotspot, then tap Discover.";
+        }
+
+        TextView status = createText(state, 14, R.color.text_primary, false);
+        status.setLineSpacing(4f, 1f);
+        status.setPadding(0, 0, 0, dp(16));
+        card.addView(status);
+
+        Button discoverBtn = createThemedButton(discovering ? "Searching..." : "Discover Wearable");
+        discoverBtn.setOnClickListener(v -> rediscoverWearable());
+        card.addView(discoverBtn);
+
+        Button wifiBtn = createButton("Change Wearable WiFi", R.drawable.button_outline, R.color.text_primary);
+        wifiBtn.setOnClickListener(v -> showWearableWifiDialog());
+        card.addView(wifiBtn);
+
+        Button phoneWifiBtn = createButton("Open Phone WiFi Settings", R.drawable.button_outline, R.color.text_primary);
+        phoneWifiBtn.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS)));
+        card.addView(phoneWifiBtn);
+
+        screenContainer.addView(card);
+    }
+
+    private void rediscoverWearable() {
+        if (discovering) {
+            showSimpleMessage("Discover Wearable", "Already searching for your wearable.");
+            return;
+        }
+
+        espIP = null;
+        lastUiSensorState = "";
+        statusText.setText("Searching for wearable...");
+        assistantSummaryText.setText("Looking for your Aegis wearable on the network.");
+        discoverESP();
+        if ("Settings".equals(selectedTab)) {
+            renderSettings();
+        }
+    }
+
+    private void showWearableWifiDialog() {
+        if (espIP == null) {
+            showSimpleMessage("Wearable Not Connected", "Tap Discover Wearable first. For first-time setup, connect your phone to the wearable setup hotspot, then discover it.");
+            return;
+        }
+
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(8), 0, dp(8), 0);
+
+        EditText ssidInput = createInput("WiFi name", analyticsPrefs.getString("last_device_wifi_ssid", ""));
+        EditText passInput = createInput("WiFi password", "");
+        passInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+
+        form.addView(ssidInput);
+        form.addView(passInput);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Change Wearable WiFi")
+                .setMessage("Send new WiFi details to the wearable. It will restart and reconnect automatically.")
+                .setView(form)
+                .setPositiveButton("Send", (dialog, which) -> {
+                    String ssid = ssidInput.getText().toString().trim();
+                    String password = passInput.getText().toString();
+                    if (ssid.isEmpty()) {
+                        showSimpleMessage("WiFi Name Required", "Please enter the WiFi name.");
+                        return;
+                    }
+                    analyticsPrefs.edit().putString("last_device_wifi_ssid", ssid).apply();
+                    sendWearableWifiSettings(ssid, password);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void sendWearableWifiSettings(String ssid, String password) {
+        new Thread(() -> {
+            boolean ok = false;
+            try {
+                URL url = new URL("http://" + espIP + "/config?ssid=" + Uri.encode(ssid) + "&pass=" + Uri.encode(password));
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(3500);
+                conn.setReadTimeout(3500);
+                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                String response = reader.readLine();
+                reader.close();
+                ok = response != null && response.contains("WIFI_SAVED");
+            } catch (Exception ignored) {}
+
+            boolean finalOk = ok;
+            runOnUiThread(() -> {
+                if (finalOk) {
+                    showSimpleMessage("WiFi Sent", "The wearable saved the new WiFi and will restart. Tap Discover after it reconnects.");
+                    espIP = null;
+                    discoverESP();
+                    if ("Settings".equals(selectedTab)) {
+                        renderSettings();
+                    }
+                } else {
+                    showSimpleMessage("Setup Failed", "Could not send WiFi details. Keep the phone connected to the same wearable network and try again.");
+                }
+            });
+        }).start();
+    }
+
+    private void showSimpleMessage(String title, String message) {
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton("OK", null)
+                .show();
+    }
 
     private void addAlarmSoundCard() {
         LinearLayout card = createCard();
@@ -1503,13 +1725,13 @@ public class MainActivity extends AppCompatActivity {
                     }
                     if (currentView == 0) {
                         graphTitle.setText("Daily Activity Trend");
-                        lineGraph.setData(new float[]{20f, 50f, 40f, 80f, 30f, 60f});
+                        lineGraph.setData(buildDailyGraphData());
                     } else if (currentView == 1) {
                         graphTitle.setText("Weekly Activity Trend");
-                        lineGraph.setData(new float[]{60f, 70f, 50f, 90f, 85f, 65f, 40f});
+                        lineGraph.setData(buildWeeklyGraphData());
                     } else {
                         graphTitle.setText("Monthly Activity Trend");
-                        lineGraph.setData(new float[]{40f, 30f, 55f, 80f});
+                        lineGraph.setData(buildMonthlyGraphData());
                     }
                     return true;
                 }
@@ -1523,7 +1745,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         lineGraph.setAccentColor(themeManager.getAccent());
-        lineGraph.setData(new float[]{20f, 50f, 40f, 80f, 30f, 60f});
+        lineGraph.setData(buildDailyGraphData());
         graphCol.addView(lineGraph, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(80)));
 
         TextView swipeHint = createText("Swipe graph for Weekly/Monthly", 10, R.color.text_muted, false);
@@ -1615,7 +1837,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void askAegisAI(String question) {
         new Thread(() -> {
-            String answer = callGemini(buildPrompt(question));
+            String answer = callGemini(question);
             runOnUiThread(() -> {
                 for (int i = chatMessages.size() - 1; i >= 0; i--) {
                     ChatMessage message = chatMessages.get(i);
@@ -1643,7 +1865,7 @@ public class MainActivity extends AppCompatActivity {
         keepKeyboardAfterChatRefresh = false;
     }
 
-    private String buildPrompt(String question) {
+    private String buildSystemInstruction() {
         return "You are Aegis AI, a friendly and human-like companion inside an elderly care app. " +
                 "You can chat naturally about ANY topic the user brings up. " +
                 "If they ask about health or safety, provide helpful, practical advice. " +
@@ -1652,10 +1874,10 @@ public class MainActivity extends AppCompatActivity {
                 ", likelyFallTime='" + getMostLikelyFallTime() +
                 "', memberAge=" + memberProfile.age +
                 ", condition='" + memberProfile.condition +
-                "'. Be conversational, brief, and friendly. User asks: " + question;
+                "'. Be conversational, brief, and friendly.";
     }
 
-    private String callGemini(String prompt) {
+    private String callGemini(String question) {
         if (BuildConfig.GEMINI_API_KEY == null || BuildConfig.GEMINI_API_KEY.trim().isEmpty()) {
             return "AI chat is not set up yet. Please check the app configuration and try again.";
         }
@@ -1670,15 +1892,41 @@ public class MainActivity extends AppCompatActivity {
             conn.setReadTimeout(30000);
             conn.setDoOutput(true);
 
-            JSONObject textPart = new JSONObject().put("text", prompt);
-            JSONObject content = new JSONObject()
+            // Build multi-turn contents array from chat history
+            JSONArray contents = new JSONArray();
+
+            // Include up to last 20 messages for context (avoid token overflow)
+            int start = Math.max(0, chatMessages.size() - 20);
+            for (int i = start; i < chatMessages.size(); i++) {
+                ChatMessage msg = chatMessages.get(i);
+                if (msg.pending) continue; // skip the typing indicator
+                String role = msg.fromUser ? "user" : "model";
+                JSONObject part = new JSONObject().put("text", msg.message);
+                JSONObject entry = new JSONObject()
+                        .put("role", role)
+                        .put("parts", new JSONArray().put(part));
+                contents.put(entry);
+            }
+
+            // Add the current question as the final user turn
+            JSONObject currentPart = new JSONObject().put("text", question);
+            JSONObject currentEntry = new JSONObject()
                     .put("role", "user")
-                    .put("parts", new JSONArray().put(textPart));
+                    .put("parts", new JSONArray().put(currentPart));
+            contents.put(currentEntry);
+
+            // System instruction (separate from conversation turns)
+            JSONObject systemPart = new JSONObject().put("text", buildSystemInstruction());
+            JSONObject systemInstruction = new JSONObject()
+                    .put("parts", new JSONArray().put(systemPart));
+
             JSONObject generationConfig = new JSONObject()
                     .put("temperature", 0.5)
                     .put("maxOutputTokens", 450);
+
             JSONObject body = new JSONObject()
-                    .put("contents", new JSONArray().put(content))
+                    .put("contents", contents)
+                    .put("systemInstruction", systemInstruction)
                     .put("generationConfig", generationConfig);
 
             try (OutputStream os = conn.getOutputStream()) {
@@ -1957,6 +2205,91 @@ public class MainActivity extends AppCompatActivity {
         String existing = analyticsPrefs.getString("fall_events", "");
         String updated = existing == null || existing.isEmpty() ? String.valueOf(timestamp) : existing + "," + timestamp;
         analyticsPrefs.edit().putString("fall_events", updated).apply();
+        pruneFallEventsIfNeeded();
+    }
+
+    /** Remove fall events older than 6 months to prevent SharedPreferences bloat. */
+    private void pruneFallEventsIfNeeded() {
+        List<Long> events = getFallEvents();
+        long sixMonthsAgo = System.currentTimeMillis() - (180L * 24 * 60 * 60 * 1000);
+        StringBuilder sb = new StringBuilder();
+        for (Long e : events) {
+            if (e >= sixMonthsAgo) {
+                if (sb.length() > 0) sb.append(",");
+                sb.append(e);
+            }
+        }
+        analyticsPrefs.edit().putString("fall_events", sb.toString()).apply();
+    }
+
+    /** Build daily graph data from real fall events (last 6 days + today). */
+    private float[] buildDailyGraphData() {
+        float[] data = new float[7];
+        Calendar cal = Calendar.getInstance();
+        List<Long> events = getFallEvents();
+        for (int i = 6; i >= 0; i--) {
+            Calendar day = (Calendar) cal.clone();
+            day.add(Calendar.DAY_OF_YEAR, -(6 - i));
+            int dayOfYear = day.get(Calendar.DAY_OF_YEAR);
+            int year = day.get(Calendar.YEAR);
+            int count = 0;
+            for (Long ts : events) {
+                Calendar ev = Calendar.getInstance();
+                ev.setTimeInMillis(ts);
+                if (ev.get(Calendar.DAY_OF_YEAR) == dayOfYear && ev.get(Calendar.YEAR) == year) {
+                    count++;
+                }
+            }
+            // Scale: 0 falls = 10 (baseline), each fall adds 30, cap at 100
+            data[i] = Math.min(100f, 10f + count * 30f);
+        }
+        return data;
+    }
+
+    /** Build weekly graph data from real fall events (last 7 weeks). */
+    private float[] buildWeeklyGraphData() {
+        float[] data = new float[7];
+        Calendar cal = Calendar.getInstance();
+        List<Long> events = getFallEvents();
+        for (int i = 6; i >= 0; i--) {
+            Calendar weekStart = (Calendar) cal.clone();
+            weekStart.add(Calendar.WEEK_OF_YEAR, -(6 - i));
+            int week = weekStart.get(Calendar.WEEK_OF_YEAR);
+            int year = weekStart.get(Calendar.YEAR);
+            int count = 0;
+            for (Long ts : events) {
+                Calendar ev = Calendar.getInstance();
+                ev.setTimeInMillis(ts);
+                if (ev.get(Calendar.WEEK_OF_YEAR) == week && ev.get(Calendar.YEAR) == year) {
+                    count++;
+                }
+            }
+            data[i] = Math.min(100f, 10f + count * 20f);
+        }
+        return data;
+    }
+
+    /** Build monthly graph data from real fall events (last 4 months). */
+    private float[] buildMonthlyGraphData() {
+        float[] data = new float[4];
+        Calendar cal = Calendar.getInstance();
+        List<Long> events = getFallEvents();
+        for (int i = 3; i >= 0; i--) {
+            Calendar month = (Calendar) cal.clone();
+            month.add(Calendar.MONTH, -(3 - i));
+            int m = month.get(Calendar.MONTH);
+            int y = month.get(Calendar.YEAR);
+            int count = 0;
+            for (Long ts : events) {
+                Calendar ev = Calendar.getInstance();
+                ev.setTimeInMillis(ts);
+                if (ev.get(Calendar.MONTH) == m && ev.get(Calendar.YEAR) == y) {
+                    count++;
+                }
+            }
+            data[i] = Math.min(100f, 10f + count * 15f);
+        }
+        return data;
     }
 
     private List<Long> getFallEvents() {
@@ -2308,6 +2641,7 @@ public class MainActivity extends AppCompatActivity {
         cancelBtn.setOnClickListener(v -> dialog.dismiss());
         saveBtn.setOnClickListener(v -> {
             emergencyNumber = "+91 " + input.getText().toString().trim();
+            analyticsPrefs.edit().putString("emergency_number", emergencyNumber).apply();
             renderSettings();
             dialog.dismiss();
         });
@@ -2322,8 +2656,8 @@ public class MainActivity extends AppCompatActivity {
         EditText input = new EditText(this);
         input.setHint(hint);
         input.setText(value);
-        input.setTextColor(Color.BLACK);
-        input.setHintTextColor(Color.DKGRAY);
+        input.setTextColor(getColor(R.color.text_primary));
+        input.setHintTextColor(getColor(R.color.text_muted));
         return input;
     }
 
@@ -2411,6 +2745,63 @@ public class MainActivity extends AppCompatActivity {
             showMemberDetailsUI();
         }
         return true;
+    }
+
+
+
+    private void dismissActiveOverlay() {
+        FrameLayout panel = activeOverlayPanel;
+        activeOverlayPanel = null;
+
+        if (panel == null) {
+            return;
+        }
+
+        android.view.ViewGroup parent = (android.view.ViewGroup) panel.getParent();
+        if (parent == null) {
+            return;
+        }
+
+        panel.animate()
+                .alpha(0f)
+                .translationY(dp(40))
+                .setDuration(180)
+                .withEndAction(() -> {
+                    try {
+                        parent.removeView(panel);
+                    } catch (Exception ignored) {}
+                    if ("Settings".equals(selectedTab)) {
+                        renderSettings();
+                    }
+                })
+                .start();
+    }
+
+    private void hideKeyboard() {
+        View focused = getCurrentFocus();
+        if (focused != null) {
+            InputMethodManager inputMethodManager = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.hideSoftInputFromWindow(focused.getWindowToken(), 0);
+            }
+            focused.clearFocus();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+        if (mediaPlayer != null) {
+            if (mediaPlayer.isPlaying()) {
+                mediaPlayer.stop();
+            }
+            mediaPlayer.release();
+            mediaPlayer = null;
+        }
+        if (vibrator != null) {
+            vibrator.cancel();
+        }
+        super.onDestroy();
     }
 
     private static class MemberProfile {
@@ -3003,6 +3394,7 @@ public class MainActivity extends AppCompatActivity {
     // ─── Theme Picker Panel ──────────────────────────────────────────────────────
     private void showThemePickerPanel() {
         FrameLayout panel = new FrameLayout(this);
+        activeOverlayPanel = panel;
         panel.setLayoutParams(new android.view.ViewGroup.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT));
@@ -3161,6 +3553,7 @@ public class MainActivity extends AppCompatActivity {
 
         panel.addView(sheet);
         ((android.view.ViewGroup) findViewById(android.R.id.content)).addView(panel);
+        activeOverlayPanel = panel;
 
         // Slide up animation
         int screenH = getResources().getDisplayMetrics().heightPixels;
@@ -3174,7 +3567,10 @@ public class MainActivity extends AppCompatActivity {
         int screenH = getResources().getDisplayMetrics().heightPixels;
         LinearLayout sheet = (LinearLayout) panel.getChildAt(1);
         sheet.animate().translationY(screenH).setInterpolator(new DecelerateInterpolator()).setDuration(280)
-                .withEndAction(() -> ((android.view.ViewGroup) findViewById(android.R.id.content)).removeView(panel))
+                .withEndAction(() -> {
+                    activeOverlayPanel = null;
+                    ((android.view.ViewGroup) findViewById(android.R.id.content)).removeView(panel);
+                })
                 .start();
         panel.getChildAt(0).animate().alpha(0f).setDuration(250).start();
     }
