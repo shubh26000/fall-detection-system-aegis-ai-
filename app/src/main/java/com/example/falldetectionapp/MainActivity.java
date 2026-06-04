@@ -60,7 +60,7 @@ public class MainActivity extends AppCompatActivity {
     private volatile String espIP = null;
     private volatile boolean discovering = false;
 
-    Handler handler = new Handler();
+    Handler handler = new Handler(android.os.Looper.getMainLooper());
     boolean fallLatched = false;
 
     MediaPlayer mediaPlayer;
@@ -96,9 +96,89 @@ public class MainActivity extends AppCompatActivity {
     private androidx.activity.result.ActivityResultLauncher<Intent> ringtonePickerLauncher;
     private ThemeManager themeManager;
 
+    // ─── Security: Encrypted SharedPreferences ───────────────────────────────────
+
+    private SharedPreferences initEncryptedPrefs() {
+        try {
+            String masterKeyAlias = androidx.security.crypto.MasterKeys.getOrCreate(
+                    androidx.security.crypto.MasterKeys.AES256_GCM_SPEC);
+            SharedPreferences encryptedPrefs = androidx.security.crypto.EncryptedSharedPreferences.create(
+                    "fall_analytics_secure",
+                    masterKeyAlias,
+                    this,
+                    androidx.security.crypto.EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    androidx.security.crypto.EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            );
+            migrateFromPlaintextPrefs(encryptedPrefs);
+            return encryptedPrefs;
+        } catch (Exception e) {
+            return getSharedPreferences("fall_analytics", MODE_PRIVATE);
+        }
+    }
+
+    private void migrateFromPlaintextPrefs(SharedPreferences encryptedPrefs) {
+        SharedPreferences oldPrefs = getSharedPreferences("fall_analytics", MODE_PRIVATE);
+        if (oldPrefs.getAll().isEmpty() || !encryptedPrefs.getAll().isEmpty()) {
+            return;
+        }
+        SharedPreferences.Editor editor = encryptedPrefs.edit();
+        for (java.util.Map.Entry<String, ?> entry : oldPrefs.getAll().entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof String) {
+                editor.putString(entry.getKey(), (String) value);
+            } else if (value instanceof Integer) {
+                editor.putInt(entry.getKey(), (Integer) value);
+            } else if (value instanceof Boolean) {
+                editor.putBoolean(entry.getKey(), (Boolean) value);
+            } else if (value instanceof Long) {
+                editor.putLong(entry.getKey(), (Long) value);
+            } else if (value instanceof Float) {
+                editor.putFloat(entry.getKey(), (Float) value);
+            }
+        }
+        editor.apply();
+        oldPrefs.edit().clear().apply();
+    }
+
+    // ─── Security: IP & Input Validation ─────────────────────────────────────────
+
+    private boolean isValidPrivateIP(String ip) {
+        if (ip == null || ip.isEmpty()) return false;
+        String[] octets = ip.split("\\.");
+        if (octets.length != 4) return false;
+        int[] parts = new int[4];
+        for (int i = 0; i < 4; i++) {
+            try {
+                parts[i] = Integer.parseInt(octets[i]);
+                if (parts[i] < 0 || parts[i] > 255) return false;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        if (parts[0] == 10) return true;
+        if (parts[0] == 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+        if (parts[0] == 192 && parts[1] == 168) return true;
+        if (parts[0] == 169 && parts[1] == 254) return true;
+        return false;
+    }
+
+    private String sanitizeInput(String input, int maxLength) {
+        if (input == null) return "";
+        String cleaned = input.replaceAll("[\\p{Cntrl}&&[^\n\t]]", "");
+        if (cleaned.length() > maxLength) {
+            cleaned = cleaned.substring(0, maxLength);
+        }
+        return cleaned.trim();
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // Prevent screenshots and screen recording of sensitive health data
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
+                WindowManager.LayoutParams.FLAG_SECURE);
+
         setContentView(R.layout.activity_main);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
@@ -126,7 +206,7 @@ public class MainActivity extends AppCompatActivity {
 
         vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
 
-        analyticsPrefs = getSharedPreferences("fall_analytics", MODE_PRIVATE);
+        analyticsPrefs = initEncryptedPrefs();
         themeManager = new ThemeManager(analyticsPrefs);
 
         // Restore persisted member profile (survives app restarts)
@@ -437,7 +517,12 @@ public class MainActivity extends AppCompatActivity {
                         socket.receive(packet);
                         String message = new String(packet.getData(), 0, packet.getLength());
                         if (message.startsWith("ESP_FALL_DETECTOR:")) {
-                            espIP = message.replace("ESP_FALL_DETECTOR:", "").trim();
+                            String candidateIP = message.replace("ESP_FALL_DETECTOR:", "").trim();
+                            // Security: validate the IP is a well-formed private address
+                            if (!isValidPrivateIP(candidateIP)) {
+                                continue; // reject spoofed/non-private IPs
+                            }
+                            espIP = candidateIP;
                             runOnUiThread(() -> {
                                 statusText.setTextColor(themeManager.getAccent());
                                 statusText.setText("Wearable found - monitoring active");
@@ -664,29 +749,42 @@ public class MainActivity extends AppCompatActivity {
 
     public String getESPData() {
         if (espIP == null) return "ERROR";
+        HttpURLConnection conn = null;
         try {
             URL url = new URL("http://" + espIP);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(2000);
             conn.setReadTimeout(2000);
             BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
             String line = reader.readLine();
             reader.close();
-            return line == null ? "ERROR" : line.trim();
+            // Security: only accept known-good responses to prevent injection
+            if (line == null) return "ERROR";
+            String trimmed = line.trim();
+            if ("FALL".equals(trimmed) || "NORMAL".equals(trimmed) || "RESET_OK".equals(trimmed)) {
+                return trimmed;
+            }
+            return "ERROR";
         } catch (Exception e) {
             return "ERROR";
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 
     private void sendReset() {
         if (espIP == null) return;
+        HttpURLConnection conn = null;
         try {
             URL url = new URL("http://" + espIP + "/reset");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(2000);
             conn.setReadTimeout(2000);
             conn.getInputStream();
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
     }
 
     private void renderHome() {
@@ -885,9 +983,11 @@ public class MainActivity extends AppCompatActivity {
         aiDesc.setText("Analyzing conditions...");
 
         new Thread(() -> {
+            HttpURLConnection geoConn = null;
+            HttpURLConnection wConn = null;
             try {
                 String geoUrl = "https://geocoding-api.open-meteo.com/v1/search?name=" + Uri.encode(city) + "&count=1&language=en&format=json";
-                HttpURLConnection geoConn = (HttpURLConnection) new URL(geoUrl).openConnection();
+                geoConn = (HttpURLConnection) new URL(geoUrl).openConnection();
                 geoConn.setConnectTimeout(5000);
                 
                 BufferedReader geoReader = new BufferedReader(new InputStreamReader(geoConn.getInputStream()));
@@ -911,7 +1011,7 @@ public class MainActivity extends AppCompatActivity {
                 String resolvedName = location.getString("name");
 
                 String weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon + "&current_weather=true";
-                HttpURLConnection wConn = (HttpURLConnection) new URL(weatherUrl).openConnection();
+                wConn = (HttpURLConnection) new URL(weatherUrl).openConnection();
                 wConn.setConnectTimeout(5000);
                 
                 BufferedReader wReader = new BufferedReader(new InputStreamReader(wConn.getInputStream()));
@@ -976,6 +1076,9 @@ public class MainActivity extends AppCompatActivity {
                     wDesc.setText("Network error");
                     aiDesc.setText("Cannot reach Aegis weather servers.");
                 });
+            } finally {
+                if (geoConn != null) geoConn.disconnect();
+                if (wConn != null) wConn.disconnect();
             }
         }).start();
     }
@@ -1410,16 +1513,20 @@ public class MainActivity extends AppCompatActivity {
     private void sendWearableWifiSettings(String ssid, String password) {
         new Thread(() -> {
             boolean ok = false;
+            HttpURLConnection conn = null;
             try {
                 URL url = new URL("http://" + espIP + "/config?ssid=" + Uri.encode(ssid) + "&pass=" + Uri.encode(password));
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn = (HttpURLConnection) url.openConnection();
                 conn.setConnectTimeout(3500);
                 conn.setReadTimeout(3500);
                 BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
                 String response = reader.readLine();
                 reader.close();
                 ok = response != null && response.contains("WIFI_SAVED");
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
 
             boolean finalOk = ok;
             runOnUiThread(() -> {
@@ -1896,10 +2003,15 @@ public class MainActivity extends AppCompatActivity {
             JSONArray contents = new JSONArray();
 
             // Include up to last 20 messages for context (avoid token overflow)
+            // Gemini requires the contents array to start with a "user" role,
+            // so skip any leading "model" messages (e.g. the initial greeting).
             int start = Math.max(0, chatMessages.size() - 20);
+            boolean foundFirstUser = false;
             for (int i = start; i < chatMessages.size(); i++) {
                 ChatMessage msg = chatMessages.get(i);
                 if (msg.pending) continue; // skip the typing indicator
+                if (!foundFirstUser && !msg.fromUser) continue; // skip leading model messages
+                foundFirstUser = true;
                 String role = msg.fromUser ? "user" : "model";
                 JSONObject part = new JSONObject().put("text", msg.message);
                 JSONObject entry = new JSONObject()
@@ -2549,13 +2661,13 @@ public class MainActivity extends AppCompatActivity {
 
         cancelBtn.setOnClickListener(v -> dialog.dismiss());
         saveBtn.setOnClickListener(v -> {
-            memberProfile.name = nameInput.getText().toString();
-            memberProfile.age = ageInput.getText().toString();
-            memberProfile.condition = conditionInput.getText().toString();
-            memberProfile.emergencyContact = "+91 " + contactInput.getText().toString().trim();
-            memberProfile.bloodGroup = bloodInput.getText().toString();
-            memberProfile.address = addressInput.getText().toString();
-            memberProfile.notes = notesInput.getText().toString();
+            memberProfile.name = sanitizeInput(nameInput.getText().toString(), 100);
+            memberProfile.age = sanitizeInput(ageInput.getText().toString(), 3);
+            memberProfile.condition = sanitizeInput(conditionInput.getText().toString(), 200);
+            memberProfile.emergencyContact = "+91 " + sanitizeInput(contactInput.getText().toString(), 10);
+            memberProfile.bloodGroup = sanitizeInput(bloodInput.getText().toString(), 5);
+            memberProfile.address = sanitizeInput(addressInput.getText().toString(), 300);
+            memberProfile.notes = sanitizeInput(notesInput.getText().toString(), 500);
             // Persist so changes survive app restarts
             analyticsPrefs.edit()
                     .putString("member_name", memberProfile.name)
@@ -2640,7 +2752,12 @@ public class MainActivity extends AppCompatActivity {
 
         cancelBtn.setOnClickListener(v -> dialog.dismiss());
         saveBtn.setOnClickListener(v -> {
-            emergencyNumber = "+91 " + input.getText().toString().trim();
+            String digits = input.getText().toString().trim().replaceAll("[^0-9]", "");
+            if (digits.length() != 10) {
+                input.setError("Enter exactly 10 digits");
+                return;
+            }
+            emergencyNumber = "+91 " + digits;
             analyticsPrefs.edit().putString("emergency_number", emergencyNumber).apply();
             renderSettings();
             dialog.dismiss();

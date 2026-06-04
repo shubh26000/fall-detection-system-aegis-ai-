@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Security policy:
+        - HTTPS required for all external traffic (Gemini API, Open-Meteo, etc.)
+        - Cleartext HTTP permitted globally ONLY because ESP8266 devices on the
+          local network use raw HTTP on dynamic IPs that can't be domain-whitelisted.
+        - The app validates ESP IPs are in private ranges (see isPrivateIP() in MainActivity).
+    -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

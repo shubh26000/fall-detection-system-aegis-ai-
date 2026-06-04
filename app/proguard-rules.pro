@@ -1,21 +1,24 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# ── Aegis Care ProGuard / R8 Rules ──────────────────────────────────────────
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Keep line numbers for crash reports
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Keep BuildConfig (contains API key reference at compile time)
+-keep class com.example.falldetectionapp.BuildConfig { *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Keep custom View subclasses (used by the UI via reflection/inflation)
+-keep class com.example.falldetectionapp.MainActivity$AnimatedLineGraphView { *; }
+-keep class com.example.falldetectionapp.MainActivity$CircularRiskMeterView { *; }
+-keep class com.example.falldetectionapp.MainActivity$LiquidSOSButton { *; }
+-keep class com.example.falldetectionapp.MainActivity$WeatherBackgroundView { *; }
+-keep class com.example.falldetectionapp.MainActivity$TypingDotsView { *; }
+-keep class com.example.falldetectionapp.MainActivity$ThemeManager { *; }
+
+# AndroidX Security Crypto
+-keep class androidx.security.crypto.** { *; }
+-keep class com.google.crypto.tink.** { *; }
+-dontwarn com.google.crypto.tink.**
+
+# Keep JSON parsing (org.json is part of Android SDK, but keep for safety)
+-keep class org.json.** { *; }
