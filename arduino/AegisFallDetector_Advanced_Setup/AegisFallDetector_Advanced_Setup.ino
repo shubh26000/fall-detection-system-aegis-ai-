@@ -15,7 +15,28 @@ const char* SETUP_AP_SSID = "AegisSetup";
 const char* SETUP_AP_PASS = "12345678";
 
 // =============================================
-//   EEPROM WIFI STORAGE
+//   CONFIG AUTH TOKEN
+//   The app must send this token with /config
+//   requests: /config?token=XXXX&ssid=...&pass=...
+//   Change this to a unique value for your device.
+// =============================================
+const char* CONFIG_AUTH_TOKEN = "aegis2026";
+
+// =============================================
+//   STATUS LED (built-in LED on most ESP boards)
+//   GPIO2 = D4 on NodeMCU/Wemos D1 Mini
+//   Built-in LED is active LOW on most boards
+// =============================================
+const int LED_PIN = LED_BUILTIN;
+const bool LED_ACTIVE_LOW = true;
+
+// =============================================
+//   EEPROM LAYOUT
+//   [0]       = WIFI_MAGIC marker
+//   [1..32]   = SSID (32 bytes)
+//   [33..96]  = Password (64 bytes)
+//   [97]      = FALL_MAGIC marker
+//   [98]      = Fall detected flag (0 or 1)
 // =============================================
 const int EEPROM_SIZE = 160;
 const int MAGIC_ADDR = 0;
@@ -24,6 +45,11 @@ const int SSID_ADDR = 1;
 const int SSID_MAX = 32;
 const int PASS_ADDR = SSID_ADDR + SSID_MAX;
 const int PASS_MAX = 64;
+
+// Fall persistence in EEPROM
+const int FALL_MAGIC_ADDR = PASS_ADDR + PASS_MAX; // 97
+const byte FALL_MAGIC = 0xF1;
+const int FALL_FLAG_ADDR = FALL_MAGIC_ADDR + 1;   // 98
 
 // =============================================
 //   MPU6050 SCALE SETTINGS
@@ -49,6 +75,18 @@ const unsigned long COOLDOWN_MS              = 5000;
 const unsigned long IP_BROADCAST_INTERVAL_MS = 3000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS  = 15000;
 
+// Non-blocking WiFi reconnect settings
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 30000; // retry every 30s
+const unsigned long WIFI_CHECK_INTERVAL_MS     = 5000;  // check connection every 5s
+
+// =============================================
+//   LED BLINK PATTERNS (intervals in ms)
+// =============================================
+const unsigned long LED_BLINK_SEARCHING   = 500;  // slow blink: searching for WiFi
+const unsigned long LED_BLINK_CONNECTED   = 0;    // solid ON: connected
+const unsigned long LED_BLINK_FALL        = 100;  // fast blink: fall detected
+const unsigned long LED_BLINK_SETUP_AP    = 250;  // medium blink: setup AP mode
+
 // =============================================
 //   GLOBALS
 // =============================================
@@ -58,11 +96,16 @@ MPU6050 mpu;
 
 bool fallDetected = false;
 bool setupApActive = false;
+bool wifiConnecting = false;
 
 unsigned long lastFallTime = 0;
 unsigned long lastBroadcastTime = 0;
 unsigned long lastSampleTime = 0;
 unsigned long lastLowGTime = 0;
+unsigned long lastWifiCheckTime = 0;
+unsigned long lastWifiReconnectAttempt = 0;
+unsigned long lastLedToggleTime = 0;
+bool ledState = false;
 
 enum FallState {
   MONITORING,
@@ -97,20 +140,56 @@ float stableY = 0.0;
 float stableZ = 1.0;
 
 // =============================================
+//   LED CONTROL
+// =============================================
+void ledOn() {
+  digitalWrite(LED_PIN, LED_ACTIVE_LOW ? LOW : HIGH);
+  ledState = true;
+}
+
+void ledOff() {
+  digitalWrite(LED_PIN, LED_ACTIVE_LOW ? HIGH : LOW);
+  ledState = false;
+}
+
+void updateLED() {
+  unsigned long now = millis();
+  unsigned long interval;
+
+  if (fallDetected) {
+    interval = LED_BLINK_FALL;
+  } else if (setupApActive) {
+    interval = LED_BLINK_SETUP_AP;
+  } else if (WiFi.status() == WL_CONNECTED) {
+    // Solid ON when connected
+    ledOn();
+    return;
+  } else {
+    interval = LED_BLINK_SEARCHING;
+  }
+
+  if (now - lastLedToggleTime >= interval) {
+    lastLedToggleTime = now;
+    if (ledState) {
+      ledOff();
+    } else {
+      ledOn();
+    }
+  }
+}
+
+// =============================================
 //   EEPROM HELPERS
 // =============================================
 String readEEPROMString(int start, int maxLen) {
   char buffer[maxLen + 1];
-  for (int i = 0; i < maxLen; i++) {
+  int i;
+  for (i = 0; i < maxLen; i++) {
     byte value = EEPROM.read(start + i);
-    if (value == 0 || value == 255) {
-      buffer[i] = '\0';
-      break;
-    }
+    if (value == 0 || value == 255) break;
     buffer[i] = (char)value;
-    if (i == maxLen - 1) buffer[maxLen] = '\0';
   }
-  buffer[maxLen] = '\0';
+  buffer[i] = '\0';
   return String(buffer);
 }
 
@@ -135,6 +214,28 @@ void saveWifiCredentials(const String& ssid, const String& pass) {
   EEPROM.commit();
 }
 
+// =============================================
+//   FALL STATE PERSISTENCE (EEPROM)
+// =============================================
+void saveFallState(bool detected) {
+  EEPROM.write(FALL_MAGIC_ADDR, FALL_MAGIC);
+  EEPROM.write(FALL_FLAG_ADDR, detected ? 1 : 0);
+  EEPROM.commit();
+}
+
+bool loadFallState() {
+  if (EEPROM.read(FALL_MAGIC_ADDR) != FALL_MAGIC) return false;
+  return EEPROM.read(FALL_FLAG_ADDR) == 1;
+}
+
+void clearFallState() {
+  EEPROM.write(FALL_FLAG_ADDR, 0);
+  EEPROM.commit();
+}
+
+// =============================================
+//   URL HELPERS
+// =============================================
 String urlDecode(String input) {
   String decoded = "";
   char temp[] = "0x00";
@@ -197,6 +298,8 @@ bool connectToWiFi(const String& ssid, const String& pass) {
   while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_CONNECT_TIMEOUT_MS) {
     delay(400);
     Serial.print(".");
+    // Feed the watchdog during blocking WiFi connect at boot
+    ESP.wdtFeed();
   }
 
   Serial.println();
@@ -227,12 +330,48 @@ void connectWiFiOrSetupAP() {
   }
 }
 
+/**
+ * Non-blocking WiFi reconnect — called from loop().
+ * Only initiates a new connection attempt every WIFI_RECONNECT_INTERVAL_MS.
+ * Uses WiFi.begin() which is non-blocking on ESP8266;
+ * connection status is checked on subsequent loop() iterations.
+ */
+void handleWiFiReconnect() {
+  unsigned long now = millis();
+
+  // Only check periodically
+  if (now - lastWifiCheckTime < WIFI_CHECK_INTERVAL_MS) return;
+  lastWifiCheckTime = now;
+
+  // Already connected or in setup AP mode — nothing to do
+  if (WiFi.status() == WL_CONNECTED || setupApActive) return;
+
+  // Rate-limit reconnection attempts
+  if (now - lastWifiReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+  lastWifiReconnectAttempt = now;
+
+  Serial.println("WiFi disconnected. Attempting non-blocking reconnect...");
+
+  String ssid;
+  String pass;
+  bool hasSaved = loadWifiCredentials(ssid, pass);
+  if (!hasSaved) {
+    ssid = DEFAULT_SSID;
+    pass = DEFAULT_PASS;
+  }
+
+  // WiFi.begin() on ESP8266 is non-blocking — it starts the connection
+  // process and returns immediately. We check WiFi.status() on future loops.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+}
+
 void broadcastOneIP(IPAddress ip) {
   if (ip[0] == 0) return;
-  IPAddress broadcastIP = ip;
-  broadcastIP[3] = 255;
 
-  udp.beginPacket(broadcastIP, 4444);
+  // Use limited broadcast (255.255.255.255) which works on all subnet sizes.
+  // Previously used subnet-specific broadcast (x.x.x.255) which only works on /24.
+  udp.beginPacket(IPAddress(255, 255, 255, 255), 4444);
   udp.print("ESP_FALL_DETECTOR:");
   udp.print(ip.toString());
   udp.endPacket();
@@ -329,6 +468,7 @@ void handleClient(WiFiClient client) {
     }
   }
 
+  // Drain any remaining data from the request
   while (client.connected() && client.available()) {
     client.read();
   }
@@ -336,15 +476,27 @@ void handleClient(WiFiClient client) {
   Serial.print("Request: ");
   Serial.println(request);
 
+  // ── Reset fall state ──────────────────────────
   if (request.indexOf("GET /reset") >= 0) {
     fallDetected = false;
     fallState = MONITORING;
+    clearFallState(); // clear persisted fall flag
     sendPlainResponse(client, "RESET_OK");
     client.stop();
     return;
   }
 
+  // ── WiFi config (authenticated) ───────────────
   if (request.indexOf("GET /config") >= 0) {
+    // Verify auth token
+    String token = getQueryParam(request, "token");
+    if (token != CONFIG_AUTH_TOKEN) {
+      Serial.println("Config rejected: invalid token");
+      sendPlainResponse(client, "AUTH_FAILED");
+      client.stop();
+      return;
+    }
+
     String newSsid = getQueryParam(request, "ssid");
     String newPass = getQueryParam(request, "pass");
 
@@ -364,6 +516,7 @@ void handleClient(WiFiClient client) {
     return;
   }
 
+  // ── Device info ───────────────────────────────
   if (request.indexOf("GET /info") >= 0) {
     String mode = setupApActive ? "SETUP" : "CONNECTED";
     sendPlainResponse(client, "AEGIS:" + mode);
@@ -371,6 +524,7 @@ void handleClient(WiFiClient client) {
     return;
   }
 
+  // ── Default: fall status poll ─────────────────
   sendPlainResponse(client, fallDetected ? "FALL" : "NORMAL");
   delay(5);
   client.stop();
@@ -428,6 +582,7 @@ void updateFallCandidate(MotionSample s) {
     if (stillAfterImpact && fallEvidence) {
       fallDetected = true;
       lastFallTime = millis();
+      saveFallState(true); // persist to EEPROM
       Serial.println("*** FALL DETECTED ***");
     } else {
       Serial.println("Rejected: not enough fall evidence");
@@ -466,6 +621,13 @@ void setup() {
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
 
+  // Initialize LED
+  pinMode(LED_PIN, OUTPUT);
+  ledOff();
+
+  // Enable hardware watchdog (8 seconds)
+  ESP.wdtEnable(8000);
+
   Wire.begin(D2, D1);
 
   mpu.initialize();
@@ -478,6 +640,13 @@ void setup() {
     Serial.println("MPU6050 NOT connected - check wiring");
   }
 
+  // Restore persisted fall state (survives ESP.restart)
+  if (loadFallState()) {
+    fallDetected = true;
+    Serial.println("Restored fall state from EEPROM — fall still active");
+  }
+
+  // Initial WiFi connect (blocking at boot — acceptable since no fall monitoring yet)
   connectWiFiOrSetupAP();
 
   server.begin();
@@ -491,18 +660,28 @@ void setup() {
 //   LOOP
 // =============================================
 void loop() {
-  if (!setupApActive && WiFi.status() != WL_CONNECTED) {
-    connectWiFiOrSetupAP();
-  }
+  // Feed the hardware watchdog
+  ESP.wdtFeed();
 
+  // Non-blocking WiFi reconnect — does NOT block fall detection
+  handleWiFiReconnect();
+
+  // Periodic IP broadcast
   if (millis() - lastBroadcastTime > IP_BROADCAST_INTERVAL_MS) {
     broadcastIP();
     lastBroadcastTime = millis();
   }
 
+  // Handle HTTP clients
   WiFiClient client = server.available();
   if (client) handleClient(client);
 
+  // Core fall detection (runs every ~20ms)
   updateFallDetection();
-  delay(5);
+
+  // Update LED status indicator
+  updateLED();
+
+  // Minimal yield to prevent WDT reset
+  yield();
 }

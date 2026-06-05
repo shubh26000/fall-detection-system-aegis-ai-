@@ -180,7 +180,10 @@ Aegis Care handles sensitive health data and implements multiple layers of secur
         │  - MPU6050 Accelerometer  │
         │  - Broadcasts IP via UDP  │
         │  - Serves FALL/NORMAL/OK  │
-        │  - WiFi OTA config        │
+        │  - WiFi OTA config (auth) │
+        │  - LED status indicator   │
+        │  - Fall state in EEPROM   │
+        │  - Hardware watchdog      │
         └───────────────────────────┘
 ```
 
@@ -206,32 +209,43 @@ Aegis Care handles sensitive health data and implements multiple layers of secur
 
 ## 🔧 Hardware Setup (ESP8266)
 
-The app expects the ESP8266 to:
+The firmware source is included at `arduino/AegisFallDetector_Advanced_Setup/`.
 
-**1. Broadcast its IP via UDP every 3 seconds:**
+### Protocol
+
+**1. UDP IP Broadcast (every 3 seconds):**
 ```cpp
-// UDP broadcast on port 4444
-WiFiUDP udp;
-udp.beginPacket("255.255.255.255", 4444);
-String msg = "ESP_FALL_DETECTOR:" + WiFi.localIP().toString();
-udp.print(msg);
+// Broadcasts on 255.255.255.255:4444 (works on all subnet sizes)
+udp.beginPacket(IPAddress(255, 255, 255, 255), 4444);
+udp.print("ESP_FALL_DETECTOR:" + WiFi.localIP().toString());
 udp.endPacket();
 ```
 
-**2. Serve fall status over HTTP on port 80:**
+**2. HTTP Endpoints (port 80):**
 ```
-GET http://<esp-ip>/       → returns "FALL" or "NORMAL"
-GET http://<esp-ip>/reset  → resets fall latch, returns "RESET_OK"
-```
-
-**3. (Optional) Accept WiFi configuration:**
-```
-GET http://<esp-ip>/config?ssid=<name>&pass=<password> → returns "WIFI_SAVED"
+GET /           → "FALL" or "NORMAL" (polled every 1s by app)
+GET /reset      → "RESET_OK" (clears fall flag + EEPROM)
+GET /config?token=aegis2026&ssid=<name>&pass=<pw> → "WIFI_SAVED" (authenticated)
+GET /info        → "AEGIS:CONNECTED" or "AEGIS:SETUP"
 ```
 
-**Recommended sensors:**
-- **MPU6050** — 6-axis accelerometer/gyroscope for fall detection
-- Any ESP8266 board (NodeMCU, Wemos D1 Mini, etc.)
+### Firmware Features
+
+| Feature | Description |
+|---|---|
+| **Advanced Fall Detection** | Low-G → Impact → Stillness → Orientation state machine with MPU6050 |
+| **Hardware Watchdog** | 8-second ESP.wdt — auto-resets if firmware hangs |
+| **LED Status Indicator** | Slow blink = searching WiFi, Solid = connected, Fast blink = fall detected, Medium = setup AP |
+| **Fall State Persistence** | Fall flag stored in EEPROM — survives `ESP.restart()` after WiFi config |
+| **Authenticated WiFi Config** | `/config` requires `token=aegis2026` — rejects unauthorized network changes |
+| **Non-blocking WiFi Reconnect** | WiFi drops don't block fall detection — reconnects in background every 30s |
+| **Setup Hotspot** | If stored WiFi fails, opens `AegisSetup` AP for initial configuration |
+
+### Hardware
+
+- **MPU6050** — 6-axis accelerometer/gyroscope (I2C on D1/D2)
+- **ESP8266** — NodeMCU, Wemos D1 Mini, or similar
+- Wiring: `SDA → D2`, `SCL → D1`, `VCC → 3.3V`, `GND → GND`
 
 ---
 
@@ -337,6 +351,9 @@ FallDetectionApp/
 │   │   │   └── themes.xml             # App theme (AMOLED dark)
 │   │   └── raw/alert.mp3             # Default alarm sound
 │   └── AndroidManifest.xml            # Permissions, security config
+├── arduino/
+│   └── AegisFallDetector_Advanced_Setup/
+│       └── AegisFallDetector_Advanced_Setup.ino  # ESP8266 firmware (~570 lines)
 ├── app/build.gradle.kts               # Dependencies, R8, security-crypto
 ├── app/proguard-rules.pro             # R8 keep rules for custom views
 ├── gradle.properties                  # JVM args, JDK path

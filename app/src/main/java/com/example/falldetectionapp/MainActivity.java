@@ -1515,7 +1515,7 @@ public class MainActivity extends AppCompatActivity {
             boolean ok = false;
             HttpURLConnection conn = null;
             try {
-                URL url = new URL("http://" + espIP + "/config?ssid=" + Uri.encode(ssid) + "&pass=" + Uri.encode(password));
+                URL url = new URL("http://" + espIP + "/config?token=aegis2026&ssid=" + Uri.encode(ssid) + "&pass=" + Uri.encode(password));
                 conn = (HttpURLConnection) url.openConnection();
                 conn.setConnectTimeout(3500);
                 conn.setReadTimeout(3500);
