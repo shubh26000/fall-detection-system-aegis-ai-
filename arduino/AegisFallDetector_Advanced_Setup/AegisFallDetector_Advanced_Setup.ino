@@ -96,7 +96,6 @@ MPU6050 mpu;
 
 bool fallDetected = false;
 bool setupApActive = false;
-bool wifiConnecting = false;
 
 unsigned long lastFallTime = 0;
 unsigned long lastBroadcastTime = 0;

@@ -1989,9 +1989,10 @@ public class MainActivity extends AppCompatActivity {
             return "AI chat is not set up yet. Please check the app configuration and try again.";
         }
 
+        HttpURLConnection conn = null;
         try {
             URL url = new URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("x-goog-api-key", BuildConfig.GEMINI_API_KEY);
@@ -2045,8 +2046,9 @@ public class MainActivity extends AppCompatActivity {
                 os.write(body.toString().getBytes(StandardCharsets.UTF_8));
             }
 
+            int responseCode = conn.getResponseCode();
             BufferedReader reader = new BufferedReader(new InputStreamReader(
-                    conn.getResponseCode() >= 400 ? conn.getErrorStream() : conn.getInputStream()
+                    responseCode >= 400 ? conn.getErrorStream() : conn.getInputStream()
             ));
             StringBuilder response = new StringBuilder();
             String line;
@@ -2055,7 +2057,7 @@ public class MainActivity extends AppCompatActivity {
             }
             reader.close();
 
-            if (conn.getResponseCode() >= 400) {
+            if (responseCode >= 400) {
                 return "AI request failed. Check the API key, billing/access, and internet connection.";
             }
 
@@ -2070,6 +2072,8 @@ public class MainActivity extends AppCompatActivity {
 
         } catch (Exception e) {
             return "I could not reach the AI service. Please check internet access, then try again.";
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 
