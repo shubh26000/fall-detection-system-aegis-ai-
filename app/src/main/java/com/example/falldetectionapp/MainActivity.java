@@ -1,5 +1,6 @@
 package com.example.falldetectionapp;
 
+import android.animation.Animator;
 import android.animation.ObjectAnimator;
 import android.animation.AnimatorListenerAdapter;
 import android.content.Context;
@@ -95,6 +96,7 @@ public class MainActivity extends AppCompatActivity {
     private SharedPreferences analyticsPrefs;
     private androidx.activity.result.ActivityResultLauncher<Intent> ringtonePickerLauncher;
     private ThemeManager themeManager;
+    private final java.util.List<Animator> activeAnimators = new java.util.ArrayList<>();
 
     // ─── Security: Encrypted SharedPreferences ───────────────────────────────────
 
@@ -863,8 +865,8 @@ public class MainActivity extends AppCompatActivity {
         pulseY.setDuration(1200);
         pulseY.setRepeatCount(ObjectAnimator.INFINITE);
         pulseY.setRepeatMode(ObjectAnimator.REVERSE);
-        pulse.start();
-        pulseY.start();
+        trackAnimator(pulse);
+        trackAnimator(pulseY);
 
         LinearLayout textCol = new LinearLayout(this);
         textCol.setOrientation(LinearLayout.VERTICAL);
@@ -1090,19 +1092,19 @@ public class MainActivity extends AppCompatActivity {
             ObjectAnimator pulseY = ObjectAnimator.ofFloat(iconView, "scaleY", 1f, 1.2f, 1f);
             pulseX.setDuration(3000); pulseY.setDuration(3000);
             pulseX.setRepeatCount(ObjectAnimator.INFINITE); pulseY.setRepeatCount(ObjectAnimator.INFINITE);
-            pulseX.start(); pulseY.start();
+            trackAnimator(pulseX); trackAnimator(pulseY);
         } else if (iconType.equals("🌧️") || iconType.equals("❄️") || iconType.equals("⛈️")) {
             ObjectAnimator slide = ObjectAnimator.ofFloat(iconView, "translationY", -10f, 10f);
             slide.setDuration(1500);
             slide.setRepeatCount(ObjectAnimator.INFINITE);
             slide.setRepeatMode(ObjectAnimator.REVERSE);
-            slide.start();
+            trackAnimator(slide);
         } else {
             ObjectAnimator drift = ObjectAnimator.ofFloat(iconView, "translationX", -10f, 10f);
             drift.setDuration(4000);
             drift.setRepeatCount(ObjectAnimator.INFINITE);
             drift.setRepeatMode(ObjectAnimator.REVERSE);
-            drift.start();
+            trackAnimator(drift);
         }
     }
 
@@ -1142,8 +1144,8 @@ public class MainActivity extends AppCompatActivity {
         pulseY.setRepeatCount(ObjectAnimator.INFINITE);
         pulse.setRepeatMode(ObjectAnimator.REVERSE);
         pulseY.setRepeatMode(ObjectAnimator.REVERSE);
-        pulse.start();
-        pulseY.start();
+        trackAnimator(pulse);
+        trackAnimator(pulseY);
 
         LinearLayout textCol = new LinearLayout(this);
         textCol.setOrientation(LinearLayout.VERTICAL);
@@ -1166,7 +1168,7 @@ public class MainActivity extends AppCompatActivity {
         ObjectAnimator waveAnim = ObjectAnimator.ofFloat(waveform, "alpha", 0.4f, 1f, 0.4f);
         waveAnim.setDuration(1200);
         waveAnim.setRepeatCount(ObjectAnimator.INFINITE);
-        waveAnim.start();
+        trackAnimator(waveAnim);
 
         row.addView(textCol);
         card.addView(row);
@@ -1222,7 +1224,7 @@ public class MainActivity extends AppCompatActivity {
             floatAnim.setDuration(1500 + (i * 200));
             floatAnim.setRepeatCount(ObjectAnimator.INFINITE);
             floatAnim.setRepeatMode(ObjectAnimator.REVERSE);
-            floatAnim.start();
+            trackAnimator(floatAnim);
 
             TextView tTitle = createText(tips[i][1], 14, R.color.text_primary, true);
             TextView tDesc = createText(tips[i][2], 12, R.color.text_secondary, false);
@@ -1292,7 +1294,7 @@ public class MainActivity extends AppCompatActivity {
         floatAnim.setDuration(1200);
         floatAnim.setRepeatCount(ObjectAnimator.INFINITE);
         floatAnim.setRepeatMode(ObjectAnimator.REVERSE);
-        floatAnim.start();
+        trackAnimator(floatAnim);
 
         LinearLayout textCol = new LinearLayout(this);
         textCol.setOrientation(LinearLayout.VERTICAL);
@@ -1775,7 +1777,7 @@ public class MainActivity extends AppCompatActivity {
         rotate.setDuration(4000);
         rotate.setRepeatCount(ObjectAnimator.INFINITE);
         rotate.setInterpolator(new android.view.animation.LinearInterpolator());
-        rotate.start();
+        trackAnimator(rotate);
 
         header.addView(title);
         header.addView(icon);
@@ -1927,6 +1929,7 @@ public class MainActivity extends AppCompatActivity {
         card.addView(label);
         if (chatMessage.pending) {
             TypingDotsView typingDotsView = new TypingDotsView(this);
+            typingDotsView.setAccentColor(themeManager.getAccent());
             LinearLayout.LayoutParams dotsParams = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     dp(34)
@@ -2783,10 +2786,22 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void resetScreen() {
+        // Cancel all tracked infinite animators to prevent leaks on detached views
+        for (Animator anim : activeAnimators) {
+            if (anim != null) anim.cancel();
+        }
+        activeAnimators.clear();
+
         activeChatWindow = null;
         activeChatMessagesContainer = null;
         activeChatMessagesScroll = null;
         screenContainer.removeAllViews();
+    }
+
+    /** Track an infinite/long-running animator so it gets canceled on tab switch. */
+    private void trackAnimator(ObjectAnimator anim) {
+        activeAnimators.add(anim);
+        anim.start();
     }
 
     private void refreshSelectedTab() {
@@ -2953,9 +2968,11 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    public class TypingDotsView extends View {
+    public static class TypingDotsView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private long startTime = System.currentTimeMillis();
+        private int accentColor = Color.parseColor("#00F5D4");
+        private boolean running = true;
 
         public TypingDotsView(android.content.Context context) {
             super(context);
@@ -2965,13 +2982,17 @@ public class MainActivity extends AppCompatActivity {
             super(context, attrs);
         }
 
+        public void setAccentColor(int color) { this.accentColor = color; }
+
+        @Override protected void onDetachedFromWindow() { running = false; super.onDetachedFromWindow(); }
+        @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); running = true; invalidate(); }
+
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
             float centerY = getHeight() / 2f;
             float startX = 18f;
-            int accent = themeManager.getAccent();
-            int r = Color.red(accent), g = Color.green(accent), b = Color.blue(accent);
+            int r = Color.red(accentColor), g = Color.green(accentColor), b = Color.blue(accentColor);
 
             for (int i = 0; i < 3; i++) {
                 double phase = ((System.currentTimeMillis() - startTime) / 260.0) + i * 0.75;
@@ -2981,7 +3002,7 @@ public class MainActivity extends AppCompatActivity {
                 canvas.drawCircle(startX + i * 24f, centerY, radius, paint);
             }
 
-            postInvalidateDelayed(45);
+            if (running) postInvalidateDelayed(45);
         }
     }
 
@@ -2993,6 +3014,7 @@ public class MainActivity extends AppCompatActivity {
         private float[] data = new float[0];
         private float drawProgress = 0f;
         private android.animation.ValueAnimator animator;
+        private final android.graphics.Path drawPath = new android.graphics.Path();
 
         public AnimatedLineGraphView(Context context) {
             super(context);
@@ -3075,6 +3097,12 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @Override
+        protected void onDetachedFromWindow() {
+            if (animator != null) animator.cancel();
+            super.onDetachedFromWindow();
+        }
+
+        @Override
         protected void onSizeChanged(int w, int h, int oldw, int oldh) {
             super.onSizeChanged(w, h, oldw, oldh);
             calculatePath();
@@ -3085,7 +3113,7 @@ public class MainActivity extends AppCompatActivity {
             super.onDraw(canvas);
             if (pathMeasure == null || data.length == 0) return;
 
-            android.graphics.Path drawPath = new android.graphics.Path();
+            drawPath.reset();
             float length = pathMeasure.getLength();
             pathMeasure.getSegment(0, length * drawProgress, drawPath, true);
 
@@ -3101,6 +3129,7 @@ public class MainActivity extends AppCompatActivity {
         private float progress = 0;
         private float targetProgress = 0;
         private android.animation.ValueAnimator animator;
+        private final android.graphics.RectF arcRect = new android.graphics.RectF();
 
         public CircularRiskMeterView(Context context) {
             super(context);
@@ -3143,6 +3172,12 @@ public class MainActivity extends AppCompatActivity {
             invalidate();
         }
 
+        @Override
+        protected void onDetachedFromWindow() {
+            if (animator != null) animator.cancel();
+            super.onDetachedFromWindow();
+        }
+
         public void setScore(int score) {
             this.targetProgress = score;
             if (score > 50) {
@@ -3169,10 +3204,10 @@ public class MainActivity extends AppCompatActivity {
             int size = Math.min(width, height);
             int padding = dp(8);
             
-            android.graphics.RectF rect = new android.graphics.RectF(padding, padding, size - padding, size - padding);
+            arcRect.set(padding, padding, size - padding, size - padding);
             
-            canvas.drawArc(rect, 135, 270, false, bgPaint);
-            canvas.drawArc(rect, 135, 270 * (progress / 100f), false, progressPaint);
+            canvas.drawArc(arcRect, 135, 270, false, bgPaint);
+            canvas.drawArc(arcRect, 135, 270 * (progress / 100f), false, progressPaint);
             
             canvas.drawText(String.valueOf((int)progress), width / 2f, (height / 2f) + (textPaint.getTextSize() / 3), textPaint);
         }
@@ -3251,6 +3286,13 @@ public class MainActivity extends AppCompatActivity {
 
         public void setOnTriggerListener(Runnable listener) {
             this.onTrigger = listener;
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            if (rippleAnim != null) rippleAnim.cancel();
+            if (progressAnim != null) progressAnim.cancel();
+            super.onDetachedFromWindow();
         }
 
         private void startRipple() {
@@ -3351,6 +3393,7 @@ public class MainActivity extends AppCompatActivity {
         private boolean isDay = true;
         private java.util.List<Particle> particles = new java.util.ArrayList<>();
         private long lastTime = System.currentTimeMillis();
+        private boolean running = true;
 
         private class Particle {
             float x, y, speedY, speedX, size, alpha;
@@ -3369,6 +3412,9 @@ public class MainActivity extends AppCompatActivity {
         private void init() {
             paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         }
+
+        @Override protected void onDetachedFromWindow() { running = false; super.onDetachedFromWindow(); }
+        @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); running = true; invalidate(); }
 
         public void setWeather(int code, boolean isDay) {
             this.weatherCode = code;
@@ -3437,7 +3483,7 @@ public class MainActivity extends AppCompatActivity {
                     canvas.drawCircle(p.x, p.y, p.size, paint);
                 }
             }
-            postInvalidateDelayed(16);
+            if (running) postInvalidateDelayed(16);
         }
     }
 

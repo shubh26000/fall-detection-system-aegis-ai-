@@ -620,6 +620,11 @@ void setup() {
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
 
+  // Prevent the ESP SDK from auto-saving WiFi credentials to flash on every
+  // WiFi.begin() call. We manage credentials ourselves via EEPROM, so this
+  // avoids wearing out the flash sector during repeated reconnect attempts.
+  WiFi.persistent(false);
+
   // Initialize LED
   pinMode(LED_PIN, OUTPUT);
   ledOff();
