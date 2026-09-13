@@ -999,7 +999,7 @@ public class MainActivity extends AppCompatActivity {
                 geoReader.close();
 
                 JSONObject geoJson = new JSONObject(geoRes.toString());
-                if (!geoJson.has("results")) {
+                if (!geoJson.has("results") || geoJson.getJSONArray("results").length() == 0) {
                     runOnUiThread(() -> {
                         wIcon.setText("❓");
                         wDesc.setText("City not found");
